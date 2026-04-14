@@ -7,17 +7,17 @@ import random
 from dataclasses import dataclass
 from typing import Tuple, Optional, Callable
 
-from gradysim.protocol.plugin.dispatcher import DispatchReturn, create_dispatcher
-from gradysim.protocol.messages.mobility import MobilityCommand, MobilityCommandType
-from gradysim.protocol.messages.telemetry import Telemetry
-from gradysim.protocol.position import Position, squared_distance
-from gradysim.protocol.interface import IProtocol
+from gradys_embedded.protocol.plugin.dispatcher import DispatchReturn, create_dispatcher
+from gradys_embedded.protocol.messages.mobility import MobilityCommand, MobilityCommandType
+from gradys_embedded.protocol.messages.telemetry import Telemetry
+from gradys_embedded.protocol.position import Position, squared_distance
+from gradys_embedded.protocol.interface import IProtocol
 
 
 @dataclass
 class RandomMobilityConfig:
     """
-    Configuration class for the [RandomMobilityPlugin][gradysim.protocol.plugin.random_mobility.RandomMobilityPlugin] class.
+    Configuration class for the [RandomMobilityPlugin][gradys_embedded.protocol.plugin.random_mobility.RandomMobilityPlugin] class.
     """
 
     x_range: Tuple[float, float] = (-50, 50)
@@ -42,13 +42,13 @@ class RandomMobilityPlugin:
     protocol.
 
     This plugin should be initialized by your protocol. To use it you should call the
-    [initiate_random_trip][gradysim.protocol.plugin.random_mobility.RandomMobilityPlugin.initiate_random_trip] method to start
+    [initiate_random_trip][gradys_embedded.protocol.plugin.random_mobility.RandomMobilityPlugin.initiate_random_trip] method to start
     a random trip. This method will make the node travel to a random waypoint and then draw a new waypoint when the
     node reaches it. This process will repeat until you call the
-    [finish_random_trip][gradysim.protocol.plugin.random_mobility.RandomMobilityPlugin.finish_random_trip] method.
+    [finish_random_trip][gradys_embedded.protocol.plugin.random_mobility.RandomMobilityPlugin.finish_random_trip] method.
 
     If you only want to make the node travel to a random waypoint once, you can use the
-    [travel_to_random_waypoint][gradysim.protocol.plugin.random_mobility.RandomMobilityPlugin.travel_to_random_waypoint] method.
+    [travel_to_random_waypoint][gradys_embedded.protocol.plugin.random_mobility.RandomMobilityPlugin.travel_to_random_waypoint] method.
     """
     def __init__(self, protocol: IProtocol, config: RandomMobilityConfig = RandomMobilityConfig()):
         """

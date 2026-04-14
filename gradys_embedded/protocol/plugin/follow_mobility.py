@@ -11,12 +11,12 @@ import json
 from dataclasses import dataclass
 from typing import Optional, Dict, Set
 
-from gradysim.protocol.plugin.dispatcher import create_dispatcher, DispatchReturn
-from gradysim.protocol.interface import IProtocol
-from gradysim.protocol.messages.communication import CommunicationCommand, CommunicationCommandType
-from gradysim.protocol.messages.mobility import GotoCoordsMobilityCommand
-from gradysim.protocol.messages.telemetry import Telemetry
-from gradysim.protocol.position import Position
+from gradys_embedded.protocol.plugin.dispatcher import create_dispatcher, DispatchReturn
+from gradys_embedded.protocol.interface import IProtocol
+from gradys_embedded.protocol.messages.communication import CommunicationCommand, CommunicationCommandType
+from gradys_embedded.protocol.messages.mobility import GotoCoordsMobilityCommand
+from gradys_embedded.protocol.messages.telemetry import Telemetry
+from gradys_embedded.protocol.position import Position
 
 BROADCAST_TIMER_TAG = "FollowMobilityPlugin__leader_broadcast_timer"
 """

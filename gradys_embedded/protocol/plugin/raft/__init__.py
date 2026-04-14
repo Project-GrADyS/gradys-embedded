@@ -20,7 +20,7 @@ Key Features:
 
 Example:
 
-    from gradysim.protocol.plugin.raft import RaftConfig, RaftMode, RaftConsensusPlugin
+    from gradys_embedded.protocol.plugin.raft import RaftConfig, RaftMode, RaftConsensusPlugin
     
     # Configure consensus
     config = RaftConfig()

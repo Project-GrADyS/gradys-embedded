@@ -3,11 +3,11 @@ import logging
 from dataclasses import dataclass
 from typing import List, Optional
 
-from gradysim.protocol.plugin.dispatcher import create_dispatcher, DispatchReturn
-from gradysim.protocol.interface import IProtocol
-from gradysim.protocol.messages.mobility import GotoCoordsMobilityCommand, SetSpeedMobilityCommand
-from gradysim.protocol.messages.telemetry import Telemetry
-from gradysim.protocol.position import Position, squared_distance
+from gradys_embedded.protocol.plugin.dispatcher import create_dispatcher, DispatchReturn
+from gradys_embedded.protocol.interface import IProtocol
+from gradys_embedded.protocol.messages.mobility import GotoCoordsMobilityCommand, SetSpeedMobilityCommand
+from gradys_embedded.protocol.messages.telemetry import Telemetry
+from gradys_embedded.protocol.position import Position, squared_distance
 
 
 class LoopMission(enum.Enum):

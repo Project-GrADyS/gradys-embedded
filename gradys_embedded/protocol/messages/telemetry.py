@@ -1,6 +1,6 @@
 from dataclasses import dataclass
 
-from gradysim.protocol.position import Position
+from gradys_embedded.protocol.position import Position
 
 
 @dataclass
