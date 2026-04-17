@@ -10,9 +10,11 @@ class RunnerConfiguration:
 
     origin_gps_coordinates: tuple[float, float, float]
 
+    initial_position: tuple[float, float, float]
+    """Initial position for the UAV in Cartesian Coordinates (x, y, z)."""
+
     uav_api_port: int
     """Port for the local UAV HTTP API"""
 
     telemetry_interval: float = 0.5
     """Seconds between telemetry polls"""
-

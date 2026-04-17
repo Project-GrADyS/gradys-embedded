@@ -6,7 +6,7 @@ from typing import TypedDict
 
 from gradys_embedded.encapsulator.interface import IProtocol
 from gradys_embedded.protocol.messages.telemetry import Telemetry
-from gradys_embedded.protocol.messages.communication import BroadcastMessageCommand
+from gradys_embedded.protocol.messages.communication import BroadcastMessageCommand, SendMessageCommand
 from gradys_embedded.protocol.plugin.mission_mobility import MissionMobilityPlugin, MissionMobilityConfiguration, LoopMission
 
 
@@ -34,6 +34,48 @@ class SimpleSender(enum.Enum):
 def report_message(message: SimpleMessage) -> str:
     return (f"Received message with {message['packet_count']} packets from "
             f"{SimpleSender(message['sender_type']).name} {message['sender']}")
+
+class SimpleSensorProtocol(IProtocol):
+    _log: logging.Logger
+    packet_count: int
+
+    def initialize(self) -> None:
+        self._log = logging.getLogger()
+        self.packet_count = 0
+
+        self._generate_packet()
+
+    def _generate_packet(self) -> None:
+        self.packet_count += 1
+        self._log.info(f"Generated packet, current count {self.packet_count}")
+        self.provider.schedule_timer("", self.provider.current_time() + 1)
+
+    def handle_timer(self, timer: str) -> None:
+        self._generate_packet()
+
+    def handle_packet(self, message: str) -> None:
+        simple_message: SimpleMessage = json.loads(message)
+        self._log.info(report_message(simple_message))
+
+        if simple_message['sender_type'] == SimpleSender.UAV.value:
+            response: SimpleMessage = {
+                'packet_count': self.packet_count,
+                'sender_type': SimpleSender.SENSOR.value,
+                'sender': self.provider.get_id()
+            }
+
+            command = SendMessageCommand(json.dumps(response), simple_message['sender'])
+            self.provider.send_communication_command(command)
+
+            self._log.info(f"Sent {response['packet_count']} packets to UAV {simple_message['sender']}")
+
+            self.packet_count = 0
+
+    def handle_telemetry(self, telemetry: Telemetry) -> None:
+        pass
+
+    def finish(self) -> None:
+        self._log.info(f"Final packet count: {self.packet_count}")
 
 class SimpleUAVProtocol(IProtocol):
     _log: logging.Logger
@@ -94,6 +136,40 @@ class SimpleUAVProtocol(IProtocol):
                  (telemetry.current_position[1] - current_wp[1]) ** 2 +
                  (telemetry.current_position[2] - current_wp[2]) ** 2) ** 0.5
         self._log.info(f"Current position: {telemetry.current_position}, current waypoint: {current_wp}, error: {error}")
+
+    def finish(self) -> None:
+        self._log.info(f"Final packet count: {self.packet_count}")
+
+class SimpleGroundStationProtocol(IProtocol):
+    _log: logging.Logger
+    packet_count: int
+
+    def initialize(self) -> None:
+        self._log = logging.getLogger()
+        self.packet_count = 0
+
+    def handle_timer(self, timer: str) -> None:
+        pass
+
+    def handle_packet(self, message: str) -> None:
+        simple_message: SimpleMessage = json.loads(message)
+        self._log.info(report_message(simple_message))
+
+        if simple_message['sender_type'] == SimpleSender.UAV.value:
+            response: SimpleMessage = {
+                'packet_count': self.packet_count,
+                'sender_type': SimpleSender.GROUND_STATION.value,
+                'sender': self.provider.get_id()
+            }
+
+            command = SendMessageCommand(json.dumps(response), simple_message['sender'])
+            self.provider.send_communication_command(command)
+
+            self.packet_count += simple_message['packet_count']
+            self._log.info(f"Sent acknowledgment to UAV {simple_message['sender']}. Current count {self.packet_count}")
+
+    def handle_telemetry(self, telemetry: Telemetry) -> None:
+        pass
 
     def finish(self) -> None:
         self._log.info(f"Final packet count: {self.packet_count}")

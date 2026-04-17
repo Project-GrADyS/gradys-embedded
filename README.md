@@ -132,7 +132,7 @@ GrADyS-Embedded is structured as a layered system that bridges protocol logic to
 
 **Runner** (`EmbeddedRunner`) -- The entry point. Creates an asyncio event loop, bootstraps the encapsulator, starts a FastAPI message server for receiving inter-node messages, and runs a periodic telemetry polling loop against the local UAV API.
 
-**Encapsulator** (`EmbbededEncapsulator`) -- Wraps a protocol instance and connects it to the embedded provider. Delegates all lifecycle events (`initialize`, `handle_timer`, `handle_packet`, `handle_telemetry`, `finish`) to the protocol.
+**Encapsulator** (`EmbeddedEncapsulator`) -- Wraps a protocol instance and connects it to the embedded provider. Delegates all lifecycle events (`initialize`, `handle_timer`, `handle_packet`, `handle_telemetry`, `finish`) to the protocol.
 
 **Provider** (`EmbeddedProvider`) -- The `IProvider` implementation that makes the protocol's abstract commands concrete:
 

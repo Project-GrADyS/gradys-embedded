@@ -134,7 +134,7 @@ class EmbeddedProvider(IProvider):
             await self._session.close()
 
 
-class EmbbededEncapsulator(IEncapsulator):
+class EmbeddedEncapsulator(IEncapsulator):
     """
     Encapsulates the protocol to work with the embedded runner.
     """

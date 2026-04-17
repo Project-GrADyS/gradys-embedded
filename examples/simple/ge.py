@@ -7,10 +7,19 @@ if __name__ == "__main__":
     runner_configuration = RunnerConfiguration(
         node_id=1,
         node_ip_dict={
-            1: "http://localhost:5000"
+            1: "http://localhost:5000",
+            2: "http://localhost:5001",
+            3: "http://localhost:5002",
+            4: "http://localhost:5003",
+            5: "http://localhost:5004",
         },
         uav_api_port=8000,
         origin_gps_coordinates=(-15.840081, -47.926642, -0.016),
+        initial_position=(0, 0, 20)
     )
     runner = EmbeddedRunner(runner_configuration, SimpleUAVProtocol)
-    runner.run()
+    setup_successfull = runner.setup()
+    if setup_successfull:
+        runner.run()
+    else:
+        print("Failed to set up runner. Check logs for details.")
