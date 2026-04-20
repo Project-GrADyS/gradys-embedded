@@ -15,7 +15,7 @@ class RunnerConfiguration:
     telemetry_interval: float = 0.5
 ```
 
-All fields except `telemetry_interval` are required. There is no validation beyond type hints; the runner will fail at runtime (usually during `setup()`) if values are incoherent.
+All fields except `telemetry_interval` are required. There is no validation beyond type hints; the runner will fail at runtime (usually inside the `POST /protocol/setup` handler) if values are incoherent.
 
 ## Per-node fields
 
@@ -49,7 +49,7 @@ Full communication details: `→ .claude/docs/cross-node-communication.md` which
 
 ### `initial_position: tuple[float, float, float]`
 
-The cartesian NEU `(x, y, z)` point the drone flies to during `setup()`. The z component is also passed as the takeoff altitude (`GET /command/takeoff?alt=<z>`).
+The cartesian NEU `(x, y, z)` point the drone flies to when `POST /protocol/setup` is handled. The z component is also passed as the takeoff altitude (`GET /command/takeoff?alt=<z>`).
 
 Choose this per-node: each drone needs a different starting point to avoid collisions on the launch pad. Typical pattern:
 
@@ -91,15 +91,14 @@ Seconds between GPS polls. Default 0.5 s is a reasonable balance between respons
 
 ## Initialization sequence
 
-When `runner.setup()` runs, the order is:
+The aiohttp session is created when `start_api()` schedules `_serve_api` (before uvicorn binds). When `POST /protocol/setup` is then handled, the order is:
 
-1. Create the aiohttp session.
-2. `GET /command/arm` → 200 required.
-3. `GET /command/takeoff?alt=<initial_position[2]>` → 200 required.
-4. Compute `cartesian_to_geo(origin_gps_coordinates, initial_position)` → `(lat, lon, alt)`.
-5. `POST /movement/go_to_gps_wait` with those coordinates — **blocks until arrival**.
+1. `GET /command/arm` → 200 required.
+2. `GET /command/takeoff?alt=<initial_position[2]>` → 200 required.
+3. Compute `cartesian_to_geo(origin_gps_coordinates, initial_position)` → `(lat, lon, alt)`.
+4. `POST /movement/go_to_gps_wait` with those coordinates — **blocks until arrival**.
 
-Any step returning non-200 aborts setup and returns `False`. Details of the runtime that follows successful setup: `→ .claude/docs/runtime-model.md` which covers bootstrap, message server, telemetry loop, and shutdown.
+Any step returning non-200 aborts setup; the endpoint returns 500 and `_setup_done` stays False so the operator can retry. Details of the runtime that follows successful setup: `→ .claude/docs/runtime-model.md` which covers bootstrap, the unified API, telemetry loop, and shutdown.
 
 ## Launching multiple nodes
 
@@ -115,7 +114,7 @@ The reference example (`examples/simple/ge.py`) hard-codes configuration; produc
 
 | Symptom | Likely cause |
 |---|---|
-| `setup()` returns `False`, log says arm failed | `uav_api` not running on `uav_api_port`; drone not GPS-locked; safety switch engaged |
+| `POST /protocol/setup` returns 500, log says arm failed | `uav_api` not running on `uav_api_port`; drone not GPS-locked; safety switch engaged |
 | Drones take off but never reach `initial_position` | `origin_gps_coordinates` does not match the drone's actual starting GPS fix — `go_to_gps_wait` spins forever |
 | Messages lost | Drifted `node_ip_dict`, unreachable peers, or both |
 | Waypoint arrival never triggers | Protocol's tolerance too tight vs. `telemetry_interval` × drone speed; drone overshoots between polls |
@@ -123,7 +122,7 @@ The reference example (`examples/simple/ge.py`) hard-codes configuration; produc
 
 ## Related docs
 
-- `→ .claude/docs/runtime-model.md` — how setup's three calls sequence, and what the run phase does with the config.
+- `→ .claude/docs/runtime-model.md` — how `start_api`, `/protocol/setup`, and `/protocol/start` sequence, and what each does with the config.
 - `→ .claude/docs/mobility-and-telemetry.md` — what `origin_gps_coordinates` and `telemetry_interval` actually control.
 - `→ .claude/docs/cross-node-communication.md` — how `node_ip_dict` is used on both the server and client sides.
-- `→ /home/fleury/gradys/major_projects/uav_api/.claude/docs/specification.md` — authoritative endpoint spec for the calls `setup()` makes.
+- `→ /home/fleury/gradys/major_projects/uav_api/.claude/docs/specification.md` — authoritative endpoint spec for the calls `/protocol/setup` makes.

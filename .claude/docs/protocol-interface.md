@@ -8,22 +8,22 @@ What follows is the **embedded-specific invocation story**: who calls each hook,
 
 | Hook | Trigger | Caller | Thread/loop |
 |---|---|---|---|
-| `initialize()` | Once, during `_bootstrap()` after the encapsulator instantiates the protocol | `EmbeddedEncapsulator.initialize()` | asyncio loop (first tick after `run()`) |
+| `initialize()` | Once, during `_bootstrap_protocol()` triggered by `POST /protocol/start` | `EmbeddedEncapsulator.initialize()` | asyncio loop |
 | `handle_timer(timer)` | `loop.call_at(timestamp, ...)` fires | `EmbeddedProvider._on_timer` → `self.handle_timer` callback | asyncio loop |
-| `handle_packet(message)` | HTTP `POST /message` arrives | FastAPI route → `encapsulator.handle_packet` | asyncio loop (uvicorn on the same loop) |
+| `handle_packet(message)` | HTTP `POST /message` arrives (after `/protocol/start`) | FastAPI route → `encapsulator.handle_packet` | asyncio loop (uvicorn on the same loop) |
 | `handle_telemetry(telemetry)` | `_periodic_telemetry` coroutine ticks | `_periodic_telemetry` → `encapsulator.handle_telemetry` | asyncio loop |
-| `finish()` | Runner shutdown (Ctrl-C or exception) | `EmbeddedRunner.run()`'s `finally` block | asyncio loop, loop about to close |
+| `finish()` | Runner shutdown (Ctrl-C or exception) | `EmbeddedRunner.start_api()`'s `finally` block | asyncio loop, loop about to close |
 
 **Every hook runs on the single asyncio loop.** There is no thread boundary. Any blocking call inside a hook freezes the message server, timer dispatch, telemetry polling, and outbound HTTP simultaneously.
 
 ## `initialize()` — one extra constraint vs. simulation
 
-In the simulator, `initialize` runs before any events fire. Here, it runs on the asyncio loop just after the encapsulator is wired — **before** the message server starts listening and before the telemetry loop ticks.
+In the simulator, `initialize` runs before any events fire. Here, it runs on the asyncio loop during the `POST /protocol/start` handler, just after the encapsulator is wired and **before** the telemetry loop ticks. The `/message` endpoint has already been serving on this node since `start_api()` launched uvicorn — but it returned 409 until `_bootstrap_protocol` populated `runner._encapsulator`.
 
 Consequences:
 
 - Timers scheduled in `initialize` will fire correctly; the loop is already running when `call_at` is set.
-- A message broadcast from `initialize` will be sent (the aiohttp session and `node_ip_dict` are both ready), but **peers may not be listening yet**. Their `_start_message_server` may still be starting when your POST hits them. Design protocols to tolerate missed bootstrap broadcasts, or delay the first broadcast with a short timer.
+- A message broadcast from `initialize` will be sent (the aiohttp session and `node_ip_dict` are both ready), but **peers may not have started yet**. Peers still waiting on their own `/protocol/start` reject incoming messages with 409. Design protocols to tolerate missed bootstrap broadcasts, or delay the first broadcast with a short timer.
 - You can safely read `self.provider.get_id()` and `self.provider.current_time()`.
 
 ## `handle_timer` — asyncio scheduling, not simulator scheduling

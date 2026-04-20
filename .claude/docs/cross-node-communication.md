@@ -6,16 +6,18 @@ Sources: `gradys_embedded/runner/message_api.py` (server), `gradys_embedded/enca
 
 ## The `/message` endpoint — what every node exposes
 
-Defined in `message_api.py`:
+Defined in the message router built by `message_api.create_app(runner)`:
 
 ```python
 class MessagePayload(BaseModel):
     message: str
     source: int
 
-@app.post("/message")
+@router.post("/message")
 async def receive_message(payload: MessagePayload):
-    encapsulator.handle_packet(payload.message)
+    if runner._encapsulator is None:
+        raise HTTPException(409, "Protocol not started")
+    runner._encapsulator.handle_packet(payload.message)
     return {"status": "ok"}
 ```
 
@@ -23,7 +25,9 @@ Wire format: JSON `{"message": "<payload string>", "source": <sender_node_id>}`.
 
 The receiver's FastAPI route hands `payload.message` to the encapsulator, which calls the protocol's `handle_packet`. **The `source` field is discarded** — if your protocol needs the sender id, embed it in the message body (every example in `examples/simple/protocol.py` does this).
 
-The server listens on `0.0.0.0:<port>` where `<port>` comes from `node_ip_dict[node_id]` for its own id. It shares the asyncio loop with the rest of the runner — there is no separate thread.
+The server listens on `0.0.0.0:<port>` where `<port>` comes from `node_ip_dict[node_id]` for its own id. The same FastAPI app also exposes the `/protocol/setup` and `/protocol/start` endpoints (`→ .claude/docs/runtime-model.md`). It shares the asyncio loop with the rest of the runner — there is no separate thread.
+
+**Until `/protocol/start` has succeeded, `/message` returns 409.** uvicorn binds the port from the moment `start_api()` runs, but the encapsulator that owns `handle_packet` only exists after start. Peers that broadcast during their own `initialize` may see this 409 on receivers that have not started yet.
 
 ## Sending — SEND
 
@@ -100,7 +104,7 @@ If you need authentication, wrap the payload in a signed envelope at the protoco
 
 ## Related docs
 
-- `→ .claude/docs/runtime-model.md` — when `_start_message_server` is launched relative to `initialize()`.
+- `→ .claude/docs/runtime-model.md` — when uvicorn (and therefore the `/message` router) starts listening relative to `/protocol/start` and `initialize()`.
 - `→ .claude/docs/configuration.md` — `node_ip_dict` shape and shared-origin requirement.
 - `→ .claude/docs/protocol-interface.md` — how `handle_packet` is invoked on the asyncio loop.
 - `→ /home/fleury/gradys/major_projects/gradys-sim-nextgen/.claude/docs/messages-and-telemetry.md` — the abstract `CommunicationCommand` types (SEND, BROADCAST).

@@ -18,8 +18,4 @@ if __name__ == "__main__":
         initial_position=(0, 0, 20)
     )
     runner = EmbeddedRunner(runner_configuration, SimpleUAVProtocol)
-    setup_successfull = runner.setup()
-    if setup_successfull:
-        runner.run()
-    else:
-        print("Failed to set up runner. Check logs for details.")
+    runner.start_api()

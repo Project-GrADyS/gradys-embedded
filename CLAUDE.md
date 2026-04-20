@@ -30,18 +30,24 @@ config = RunnerConfiguration(
 )
 
 runner = EmbeddedRunner(config, SimpleUAVProtocol)
-if runner.setup():    # arm → takeoff → fly to initial position
-    runner.run()      # event loop, message server, telemetry polling
+runner.start_api()    # owns the loop; serves /message + /protocol routers
 ```
 
-Each drone runs its own `EmbeddedRunner` with a unique `node_id`; `uav_api` must be running locally on `uav_api_port` on that drone.
+`start_api()` is the only public method. The runner does **not** arm, take off, or instantiate the protocol on its own — those are driven by HTTP calls into the `/protocol` router after the API is up:
+
+```bash
+curl -X POST http://<drone>:<port>/protocol/setup   # arm + takeoff + go to initial_position
+curl -X POST http://<drone>:<port>/protocol/start   # initialize protocol + begin telemetry polling
+```
+
+Each drone runs its own `EmbeddedRunner` with a unique `node_id`; `uav_api` must be running locally on `uav_api_port` on that drone before `/protocol/setup` is called.
 
 ## Hardware gotchas
 
 These are the things that bite you on real flights and don't show up in simulation.
 
 1. **Every node must share the same `origin_gps_coordinates`.** Positions in protocol code are cartesian (NEU: x=North, y=East, z=Up, meters). If two nodes use different origins, their cartesian frames disagree and messages like "go to (50, 0, 20)" mean different places. No code check enforces this — it is an operational invariant.
-2. **`uav_api` must be reachable at `http://localhost:<uav_api_port>` before `setup()` runs.** `setup()` performs `arm → takeoff → go_to_gps_wait(initial_position)` synchronously; any of these failing returns `False` and the runner refuses to `run()`.
+2. **`uav_api` must be reachable at `http://localhost:<uav_api_port>` before `POST /protocol/setup` is called.** That handler runs `arm → takeoff → go_to_gps_wait(initial_position)`; any failure returns HTTP 500 and `/protocol/start` will refuse with 409 until setup succeeds.
 3. **Outbound communication is fire-and-forget.** `SendMessageCommand` / `BroadcastMessageCommand` schedule an `aiohttp.post` as an asyncio task; failures are logged but the protocol is never told a peer was unreachable. Design protocols assuming unreliable delivery.
 4. **`handle_telemetry` is polled, not pushed.** Default poll interval is `telemetry_interval=0.5` s. A protocol that relies on sub-second position reaction (tight waypoint tolerance, fast-moving objects) needs a lower interval and a UAV API that can keep up.
 5. **Asyncio-only.** The provider schedules timers with `loop.call_at`, and all HTTP traffic runs on a single `asyncio.new_event_loop()`. Blocking calls inside protocol hooks freeze the message server and telemetry loop. Keep `handle_*` methods non-blocking.
@@ -50,7 +56,7 @@ These are the things that bite you on real flights and don't show up in simulati
 
 ## Key concepts
 
-- **`EmbeddedRunner`** (`gradys_embedded/runner/runner.py`) — entry point; owns the asyncio loop, boots the encapsulator, starts the message server, polls telemetry.
+- **`EmbeddedRunner`** (`gradys_embedded/runner/runner.py`) — entry point; sole public method `start_api()` owns the asyncio loop and serves the unified FastAPI app. Setup (arm/takeoff) and start (encapsulator + telemetry) are triggered by `POST /protocol/setup` and `POST /protocol/start`.
 - **`EmbeddedEncapsulator`** (`gradys_embedded/encapsulator/embedded.py`) — wraps a protocol and delegates the five `IProtocol` hooks.
 - **`EmbeddedProvider`** (same file) — the `IProvider` implementation that turns abstract commands into HTTP against `uav_api` and peer nodes, plus `loop.call_at` timers.
 - **`RunnerConfiguration`** (`gradys_embedded/runner/configuration.py`) — `node_id`, `node_ip_dict`, `origin_gps_coordinates`, `initial_position`, `uav_api_port`, `telemetry_interval`.
@@ -60,14 +66,14 @@ These are the things that bite you on real flights and don't show up in simulati
 
 | Path | Purpose |
 |---|---|
-| `gradys_embedded/runner/` | `EmbeddedRunner`, `RunnerConfiguration`, FastAPI message server |
+| `gradys_embedded/runner/` | `EmbeddedRunner`, `RunnerConfiguration`, FastAPI app (`message_api.py`: `message` + `protocol` routers) |
 | `gradys_embedded/encapsulator/` | `IEncapsulator`, `EmbeddedEncapsulator`, `EmbeddedProvider` |
 | `gradys_embedded/protocol/` | Mirrors sim-nextgen: `interface.py` (IProtocol/IProvider), `messages/`, `position.py`, `plugin/` |
 | `examples/simple/` | Sensor/UAV/ground-station trio; reference for wiring `ge.py` + `protocol.py` |
 
 ## When to open which doc
 
-- `→ .claude/docs/runtime-model.md` — `EmbeddedRunner` lifecycle (`setup`, `run`, message server, telemetry polling, shutdown). Open when debugging startup, boot order, or the asyncio loop.
+- `→ .claude/docs/runtime-model.md` — `EmbeddedRunner` lifecycle (`start_api`, `/protocol/setup`, `/protocol/start`, telemetry polling, shutdown). Open when debugging startup, boot order, or the asyncio loop.
 - `→ .claude/docs/protocol-interface.md` — embedded-specific **implementation notes** only. For the authoritative IProtocol/IProvider contract, follow the pointer inside this doc to `gradys-sim-nextgen`.
 - `→ .claude/docs/mobility-and-telemetry.md` — NEU↔GPS conversion, `MobilityCommand` → uav_api endpoint map, telemetry polling path. Open when movement or positioning is involved.
 - `→ .claude/docs/cross-node-communication.md` — `/message` FastAPI endpoint, SEND vs BROADCAST HTTP semantics, fire-and-forget failure modes. Open when a message is not arriving.

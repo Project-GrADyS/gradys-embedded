@@ -83,7 +83,20 @@ configuration = RunnerConfiguration(
 )
 
 runner = EmbeddedRunner(configuration, MyProtocol)
-runner.run()
+runner.start_api()
+```
+
+`start_api()` is the only public entry point. It owns the asyncio loop and serves a FastAPI app with two routers:
+
+- `POST /message` — inter-node delivery (forwarded to the protocol's `handle_packet`).
+- `POST /protocol/setup` — arms the drone, takes off, and flies to `initial_position`.
+- `POST /protocol/start` — instantiates the protocol, calls `initialize()`, and starts the telemetry polling loop.
+
+After launching the runner, an external client (operator console, sitl-tester, `curl`) drives the drone end-to-end:
+
+```bash
+curl -X POST http://<drone>:<port>/protocol/setup
+curl -X POST http://<drone>:<port>/protocol/start
 ```
 
 Each node in the network runs its own instance of `EmbeddedRunner` with a unique `node_id`.
@@ -130,7 +143,7 @@ GrADyS-Embedded is structured as a layered system that bridges protocol logic to
 
 ### Components
 
-**Runner** (`EmbeddedRunner`) -- The entry point. Creates an asyncio event loop, bootstraps the encapsulator, starts a FastAPI message server for receiving inter-node messages, and runs a periodic telemetry polling loop against the local UAV API.
+**Runner** (`EmbeddedRunner`) -- The entry point. Exposes a single public method, `start_api()`, which creates the asyncio event loop and schedules a task that serves a FastAPI app with `/message`, `/protocol/setup`, and `/protocol/start` endpoints. `/protocol/setup` arms and takes off; `/protocol/start` bootstraps the encapsulator, calls the protocol's `initialize`, and begins the telemetry polling loop.
 
 **Encapsulator** (`EmbeddedEncapsulator`) -- Wraps a protocol instance and connects it to the embedded provider. Delegates all lifecycle events (`initialize`, `handle_timer`, `handle_packet`, `handle_telemetry`, `finish`) to the protocol.
 
@@ -140,7 +153,7 @@ GrADyS-Embedded is structured as a layered system that bridges protocol logic to
 - **Mobility commands** become HTTP calls to the local UAV API. `GOTO_COORDS` converts cartesian coordinates to GPS (using the configured origin) and calls `/movement/go_to_gps`. `GOTO_GEO_COORDS` calls the same endpoint directly. `SET_SPEED` calls `/command/set_air_speed`.
 - **Timers** use the asyncio event loop's `call_at` for scheduling.
 
-**Message API** -- A FastAPI application with a single `POST /message` endpoint. Each node runs one on the port specified in `node_ip_dict` for its own `node_id`. When a message arrives, it is forwarded to the protocol via `handle_packet`.
+**Message API** -- A FastAPI application that bundles two routers on the port specified in `node_ip_dict` for the node's own id: a message router (`POST /message`, forwarded to `handle_packet`) and a protocol router (`POST /protocol/setup`, `POST /protocol/start`) that drives the runner's lifecycle from outside the process.
 
 **Position Utilities** -- Functions for converting between GPS coordinates and a local cartesian frame (North-East-Up) using haversine distance calculations. All nodes must share the same `origin_gps_coordinates` so their cartesian frames are consistent.
 
