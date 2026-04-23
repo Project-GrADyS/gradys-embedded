@@ -23,6 +23,7 @@ class EmbeddedProvider(IProvider):
         self.node_id = runner_configuration.node_id
         self.node_ip_dict = runner_configuration.node_ip_dict
         self.origin_gps_coordinates = runner_configuration.origin_gps_coordinates
+        self.x_axis_degrees = runner_configuration.x_axis_degrees
         self._timer_callback: Callable[[str], None] = timer_callback
         self._session = session
 
@@ -86,7 +87,7 @@ class EmbeddedProvider(IProvider):
 
     def send_mobility_command(self, command: MobilityCommand) -> None:
         if command.command_type == MobilityCommandType.GOTO_COORDS:
-            lat, lon, alt = cartesian_to_geo(self.origin_gps_coordinates, (command.param_1, command.param_2, command.param_3))
+            lat, lon, alt = cartesian_to_geo(self.origin_gps_coordinates, (command.param_1, command.param_2, command.param_3), self.x_axis_degrees)
             self._fire_and_forget(self._post(
                 f"{self._uav_base_url}/movement/go_to_gps",
                 {"lat": lat, "long": lon, "alt": alt, "look_at_target": False}

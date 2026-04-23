@@ -46,22 +46,30 @@ class EmbeddedRunner:
                 self._loop.run_until_complete(self._session.close())
             self._loop.close()
 
-    async def _ensure_origin(self) -> None:
-        if self._configuration.origin_gps_coordinates is not None:
+    async def _ensure_origin_and_heading(self) -> None:
+        need_origin = self._configuration.origin_gps_coordinates is None
+        need_heading = self._configuration.x_axis_degrees is None
+        if not (need_origin or need_heading):
             return
 
-        self._logger.info("No origin GPS coordinates provided, fetching current UAV position as origin...")
+        missing = ", ".join(name for name, want in [("origin", need_origin), ("x_axis_degrees", need_heading)] if want)
+        self._logger.info(f"Fetching UAV telemetry to resolve: {missing}")
         async with self._session.get(f"http://localhost:{self._configuration.uav_api_port}/telemetry/gps") as resp:
             data = await resp.json()
             info = data["info"]
+
+        if need_origin:
             pos = info["position"]
             self._configuration.origin_gps_coordinates = (pos["lat"], pos["lon"], pos["relative_alt"])
-            
             self._logger.info(f"Origin GPS coordinates set to: {self._configuration.origin_gps_coordinates}")
+        if need_heading:
+            self._configuration.x_axis_degrees = float(info["heading"])
+            self._logger.info(f"x_axis_degrees set to: {self._configuration.x_axis_degrees}")
+
     async def _serve_api(self) -> None:
         self._session = aiohttp.ClientSession()
 
-        await self._ensure_origin()
+        await self._ensure_origin_and_heading()
 
         own_addr = self._configuration.node_ip_dict[self._configuration.node_id]
         _, port_str = own_addr.rsplit(":", 1)
@@ -82,7 +90,7 @@ class EmbeddedRunner:
         if takeoff_result.status != 200:
             self._logger.fatal(f"Failed to take off UAV: {await takeoff_result.text()}")
             return False
-        initial_gps_coordinates = cartesian_to_geo(self._configuration.origin_gps_coordinates, self._configuration.initial_position)
+        initial_gps_coordinates = cartesian_to_geo(self._configuration.origin_gps_coordinates, self._configuration.initial_position, self._configuration.x_axis_degrees)
 
         movement_result = await self._session.post(f"http://localhost:{self._configuration.uav_api_port}/movement/go_to_gps_wait", json={"lat": initial_gps_coordinates[0], "long": initial_gps_coordinates[1], "alt": initial_gps_coordinates[2]})
         if movement_result.status != 200:
@@ -102,6 +110,7 @@ class EmbeddedRunner:
         base_url = f"http://localhost:{self._configuration.uav_api_port}"
         interval = self._configuration.telemetry_interval
         origin = self._configuration.origin_gps_coordinates
+        x_axis = self._configuration.x_axis_degrees
 
         while True:
             try:
@@ -112,7 +121,7 @@ class EmbeddedRunner:
                 pos = info["position"]
                 geo_coords = (pos["lat"], pos["lon"], pos["relative_alt"])
 
-                cartesian = geo_to_cartesian(origin, geo_coords)
+                cartesian = geo_to_cartesian(origin, geo_coords, x_axis)
                 telemetry = Telemetry(current_position=cartesian)
                 self._encapsulator.handle_telemetry(telemetry)
 

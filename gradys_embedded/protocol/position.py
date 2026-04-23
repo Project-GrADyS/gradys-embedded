@@ -29,36 +29,43 @@ def _haversine_distance(coord1, coord2):
     return distance
 
 
-def geo_to_cartesian(ref_coord: Tuple[float, float, float], target_coord: Tuple[float, float, float]) -> Position:
-    # Function to convert geographical coordinates to Cartesian coordinates
-    # ref_coord is the reference point (latitude, longitude)
-    # target_coord is the target point (latitude, longitude)
+def geo_to_cartesian(ref_coord: Tuple[float, float, float], target_coord: Tuple[float, float, float], x_axis_degrees: float = 0.0) -> Position:
+    # ref_coord is the reference point (latitude, longitude, altitude)
+    # target_coord is the target point (latitude, longitude, altitude)
+    # x_axis_degrees rotates the protocol frame clockwise from true north
 
-    # Calculate distances
-    # NEU convention: x=North, y=East, z=Up
-    dx = _haversine_distance((ref_coord[0], ref_coord[1]), (target_coord[0], ref_coord[1]))  # North
-    dy = _haversine_distance((ref_coord[0], ref_coord[1]), (ref_coord[0], target_coord[1]))  # East
+    dn = _haversine_distance((ref_coord[0], ref_coord[1]), (target_coord[0], ref_coord[1]))
+    de = _haversine_distance((ref_coord[0], ref_coord[1]), (ref_coord[0], target_coord[1]))
 
-    x = dx if target_coord[0] >= ref_coord[0] else -dx  # North
-    y = dy if target_coord[1] >= ref_coord[1] else -dy  # East
-    z = target_coord[2] - ref_coord[2]                 # Up
+    north = dn if target_coord[0] >= ref_coord[0] else -dn
+    east = de if target_coord[1] >= ref_coord[1] else -de
+    z = target_coord[2] - ref_coord[2]
+
+    theta = math.radians(x_axis_degrees)
+    cos_t, sin_t = math.cos(theta), math.sin(theta)
+    x = north * cos_t + east * sin_t
+    y = -north * sin_t + east * cos_t
 
     return x, y, z
 
 
-def cartesian_to_geo(ref_coord: Tuple[float, float, float], target_coord: Tuple[float, float, float]) -> Tuple[float, float, float]:
-    # Function to convert Cartesian coordinates back to geographical coordinates
-    # ref_coord is the reference point (latitude, longitude)
-    # target_coord is the target point (x, y, z)
+def cartesian_to_geo(ref_coord: Tuple[float, float, float], target_coord: Tuple[float, float, float], x_axis_degrees: float = 0.0) -> Tuple[float, float, float]:
+    # ref_coord is the reference point (latitude, longitude, altitude)
+    # target_coord is the target point (x, y, z) in the rotated protocol frame
+    # x_axis_degrees rotates the protocol frame clockwise from true north
 
-    # Calculate latitude and longitude offsets
-    dlat = target_coord[0] / 111320  # Approximate conversion from meters to degrees latitude
-    dlon = target_coord[1] / (111320 * math.cos(math.radians(ref_coord[0])))  # Approximate conversion from meters to degrees longitude
+    x, y, z = target_coord
+    theta = math.radians(x_axis_degrees)
+    cos_t, sin_t = math.cos(theta), math.sin(theta)
+    north = x * cos_t - y * sin_t
+    east = x * sin_t + y * cos_t
 
-    # Calculate geographical coordinates
+    dlat = north / 111320
+    dlon = east / (111320 * math.cos(math.radians(ref_coord[0])))
+
     lat = ref_coord[0] + dlat
     lon = ref_coord[1] + dlon
-    alt = ref_coord[2] + target_coord[2]
+    alt = ref_coord[2] + z
 
     return lat, lon, alt
 
