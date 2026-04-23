@@ -1,0 +1,18 @@
+count = 2
+origin_gps = [-15.840081, -47.926642, 0.016]
+base_uav_api_port = 8000
+base_mavlink_port = 17171
+base_embedded_port = 5000
+base_sysid = 10
+ardupilot_path = "~/ardupilot"
+sitl_location = "AbraDF"
+speedup = 1
+gs_connection = ["172.23.192.1:15630"]
+
+[[drones]]
+node_id = 0
+initial_position = [0.0, 0.0, 20.0]
+
+[[drones]]
+node_id = 1
+initial_position = [10.0, 0.0, 20.0]
