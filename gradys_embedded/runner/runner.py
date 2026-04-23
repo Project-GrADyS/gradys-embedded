@@ -46,8 +46,22 @@ class EmbeddedRunner:
                 self._loop.run_until_complete(self._session.close())
             self._loop.close()
 
+    async def _ensure_origin(self) -> None:
+        if self._configuration.origin_gps_coordinates is not None:
+            return
+
+        self._logger.info("No origin GPS coordinates provided, fetching current UAV position as origin...")
+        async with self._session.get(f"http://localhost:{self._configuration.uav_api_port}/telemetry/gps") as resp:
+            data = await resp.json()
+            info = data["info"]
+            pos = info["position"]
+            self._configuration.origin_gps_coordinates = (pos["lat"], pos["lon"], pos["relative_alt"])
+            
+            self._logger.info(f"Origin GPS coordinates set to: {self._configuration.origin_gps_coordinates}")
     async def _serve_api(self) -> None:
         self._session = aiohttp.ClientSession()
+
+        await self._ensure_origin()
 
         own_addr = self._configuration.node_ip_dict[self._configuration.node_id]
         _, port_str = own_addr.rsplit(":", 1)
