@@ -8,7 +8,7 @@ from gradys_embedded.protocol.messages.communication import SendMessageCommand
 from gradys_embedded.protocol.plugin.follow_mobility import MobilityLeaderPlugin, MobilityLeaderConfiguration, MobilityFollowerPlugin, MobilityFollowerConfiguration
 WAITING_INTERVAL = 5
 ORIGINAL_POINT = (0,0,4)
-FAR_POINT = (10,0,4)
+FAR_POINT = (3,0,4)
 WP_TOLERANCE = 1
 
 class LeaderProtocol(IProtocol):
