@@ -22,3 +22,12 @@ class RunnerConfiguration:
 
     telemetry_interval: float = 0.5
     """Seconds between telemetry polls"""
+
+    udp: bool = False
+    """Serve the inter-node message API over QUIC/HTTP3 (UDP) via Hypercorn instead of HTTP/TCP via uvicorn. TCP by default. Must be identical on every node in the fleet. Does not affect the local uav_api connection, which always uses plain HTTP on localhost."""
+
+    certfile: str | None = None
+    """TLS certificate (PEM) for the QUIC server in udp mode. When set, it is also used as the client trust anchor to verify peers. If None, the server binds with an ephemeral self-signed certificate generated at boot and client-side peer verification is disabled. Ignored when udp is False."""
+
+    keyfile: str | None = None
+    """TLS private key (PEM) paired with certfile. Required when certfile is provided. Ignored when udp is False or when certfile is None."""

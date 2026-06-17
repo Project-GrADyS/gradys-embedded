@@ -29,5 +29,12 @@ dependencies = [
     'pydantic>=2.12.5'
 ]
 
+[project.optional-dependencies]
+udp = [
+    'hypercorn[h3]>=0.17.0',
+    'niquests>=3.12.2',
+    'cryptography>=41.0.0'
+]
+
 [project.urls]
 "Homepage" = "https://github.com/Project-GrADyS/gradys-embedded"

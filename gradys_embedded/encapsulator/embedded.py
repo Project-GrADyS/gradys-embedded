@@ -34,6 +34,13 @@ class EmbeddedProvider(IProvider):
         self._uav_base_url = f"http://localhost:{runner_configuration.uav_api_port}"
         self._timers: dict[str, asyncio.TimerHandle] = {}
 
+        # Inter-node message transport. UDP mode serves/sends over QUIC/HTTP3 (https),
+        # verifying peers only when an explicit certfile is configured. The local uav_api
+        # connection above always stays on plain HTTP regardless of this setting.
+        self._udp = runner_configuration.udp
+        self._peer_certfile = runner_configuration.certfile
+        self._h3_session = None
+
     def set_timer_callback(self, callback: Callable[[str], None]) -> None:
         self._timer_callback = callback
 
@@ -55,6 +62,24 @@ class EmbeddedProvider(IProvider):
         except Exception as e:
             self._logger.error(f"POST {url} failed: {e}")
 
+    async def _send_to_peer(self, addr: str, payload: dict) -> None:
+        if not self._udp:
+            await self._post(f"http://{addr}/message", payload)
+            return
+
+        if self._h3_session is None:
+            import niquests
+            self._h3_session = niquests.AsyncSession()
+            self._h3_session.verify = self._peer_certfile or False
+
+        url = f"https://{addr}/message"
+        try:
+            resp = await self._h3_session.post(url, json=payload)
+            if resp.status_code != 200:
+                self._logger.error(f"POST {url} returned {resp.status_code}: {resp.text}")
+        except Exception as e:
+            self._logger.error(f"POST {url} failed: {e}")
+
     def _fire_and_forget(self, coro) -> None:
         task = self._loop.create_task(coro)
         task.add_done_callback(self._log_task_exception)
@@ -72,16 +97,16 @@ class EmbeddedProvider(IProvider):
             if dest_addr is None:
                 self._logger.warning(f"Unknown destination node {command.destination}")
                 return
-            self._fire_and_forget(self._post(
-                f"http://{dest_addr}/message",
+            self._fire_and_forget(self._send_to_peer(
+                dest_addr,
                 {"message": command.message, "source": self.node_id}
             ))
 
         elif command.command_type == CommunicationCommandType.BROADCAST:
             for nid, addr in self.node_ip_dict.items():
                 if nid != self.node_id:
-                    self._fire_and_forget(self._post(
-                        f"http://{addr}/message",
+                    self._fire_and_forget(self._send_to_peer(
+                        addr,
                         {"message": command.message, "source": self.node_id}
                     ))
 
@@ -133,6 +158,8 @@ class EmbeddedProvider(IProvider):
     async def close(self) -> None:
         if self._session is not None and not self._session.closed:
             await self._session.close()
+        if self._h3_session is not None:
+            await self._h3_session.close()
 
 
 class EmbeddedEncapsulator(IEncapsulator):

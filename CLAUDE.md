@@ -53,14 +53,15 @@ These are the things that bite you on real flights and don't show up in simulati
 5. **Asyncio-only.** The provider schedules timers with `loop.call_at`, and all HTTP traffic runs on a single `asyncio.new_event_loop()`. Blocking calls inside protocol hooks freeze the message server and telemetry loop. Keep `handle_*` methods non-blocking.
 6. **`current_time()` is `loop.time()` — a monotonic clock.** It is *not* GPS time, UTC, or wall-clock time. Cross-node time comparisons require a separate synchronization mechanism.
 7. **`node_ip_dict` is the peer directory and cannot be changed at runtime.** Every node must already know every other node's `ip:port`. There is no discovery protocol.
+8. **`udp` must match across the fleet.** It selects the message-API transport (TCP/uvicorn by default vs QUIC/HTTP3/Hypercorn when `True`) and requires `pip install "gradys-embedded[udp]"`. Mixed transports cannot talk to each other. Unrelated to `uav_api`'s own `--udp` flag — the local `uav_api` connection is always plain HTTP on `localhost`.
 
 ## Key concepts
 
 - **`EmbeddedRunner`** (`gradys_embedded/runner/runner.py`) — entry point; sole public method `start_api()` owns the asyncio loop and serves the unified FastAPI app. Setup (arm/takeoff) and start (encapsulator + telemetry) are triggered by `POST /protocol/setup` and `POST /protocol/start`.
 - **`EmbeddedEncapsulator`** (`gradys_embedded/encapsulator/embedded.py`) — wraps a protocol and delegates the five `IProtocol` hooks.
 - **`EmbeddedProvider`** (same file) — the `IProvider` implementation that turns abstract commands into HTTP against `uav_api` and peer nodes, plus `loop.call_at` timers.
-- **`RunnerConfiguration`** (`gradys_embedded/runner/configuration.py`) — `node_id`, `node_ip_dict`, `origin_gps_coordinates`, `initial_position`, `uav_api_port`, `telemetry_interval`.
-- **Message API** (`gradys_embedded/runner/message_api.py`) — a FastAPI app with `POST /message` that each node runs on its own port.
+- **`RunnerConfiguration`** (`gradys_embedded/runner/configuration.py`) — `node_id`, `node_ip_dict`, `origin_gps_coordinates`, `initial_position`, `uav_api_port`, `telemetry_interval`, `udp` (+ optional `certfile`/`keyfile`).
+- **Message API** (`gradys_embedded/runner/message_api.py`) — a FastAPI app with `POST /message` that each node runs on its own port. Served over HTTP/TCP (uvicorn) by default, or QUIC/HTTP3 (Hypercorn) when `udp=True`; same app and payload either way.
 
 ## Directories
 

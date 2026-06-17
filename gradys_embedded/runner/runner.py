@@ -76,9 +76,33 @@ class EmbeddedRunner:
         port = int(port_str)
 
         app = create_app(self)
-        config = uvicorn.Config(app, host="0.0.0.0", port=port, loop="asyncio")
-        server = uvicorn.Server(config)
-        await server.serve()
+        if self._configuration.udp:
+            await self._serve_udp(app, port)
+        else:
+            config = uvicorn.Config(app, host="0.0.0.0", port=port, loop="asyncio")
+            server = uvicorn.Server(config)
+            await server.serve()
+
+    async def _serve_udp(self, app, port: int) -> None:
+        from hypercorn.config import Config
+        from hypercorn.asyncio import serve
+
+        from gradys_embedded.runner.certs import generate_self_signed_cert
+
+        certfile = self._configuration.certfile
+        keyfile = self._configuration.keyfile
+        if certfile is None or keyfile is None:
+            certfile, keyfile = generate_self_signed_cert()
+            self._logger.info("No TLS cert provided; using an ephemeral self-signed certificate for the QUIC server")
+
+        config = Config()
+        config.bind = [f"0.0.0.0:{port}"]
+        config.quic_bind = [f"0.0.0.0:{port}"]
+        config.certfile = certfile
+        config.keyfile = keyfile
+
+        # The runner's event loop owns the lifecycle; never let Hypercorn self-shutdown.
+        await serve(app, config, shutdown_trigger=lambda: asyncio.Future())
 
     async def _goto_initial_position(self) -> bool:
         arm_result = await self._session.get(f"http://localhost:{self._configuration.uav_api_port}/command/arm")
