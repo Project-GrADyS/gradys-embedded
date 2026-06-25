@@ -1,10 +1,11 @@
-"""Ephemeral TLS certificate generation for the QUIC/HTTP3 message API.
+"""Ephemeral TLS certificate generation for the TLS message-API server ("https" and "http3" modes).
 
-QUIC mandates TLS 1.3, so the message-API server cannot bind without presenting a
-certificate. When the operator does not supply one via ``RunnerConfiguration``, the runner
-generates a throwaway self-signed certificate at boot. It is written to temporary files for
-Hypercorn to read and is never reused across runs nor used as a client trust anchor — peer
-verification stays disabled unless an explicit ``certfile`` is configured.
+Both the "https" (uvicorn over TLS) and "http3" (Hypercorn over QUIC, which mandates TLS 1.3)
+transports require the message-API server to present a certificate. When the operator does not
+supply one via ``RunnerConfiguration``, the runner generates a throwaway self-signed certificate
+at boot. It is written to temporary files for the server to read and is never reused across runs
+nor used as a client trust anchor — peer verification stays disabled unless an explicit
+``certfile`` is configured.
 """
 
 import datetime

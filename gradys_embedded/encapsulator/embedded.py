@@ -1,5 +1,6 @@
 import asyncio
 import logging
+import ssl
 import aiohttp
 from typing import Type, Callable, Optional
 
@@ -34,11 +35,13 @@ class EmbeddedProvider(IProvider):
         self._uav_base_url = f"http://localhost:{runner_configuration.uav_api_port}"
         self._timers: dict[str, asyncio.TimerHandle] = {}
 
-        # Inter-node message transport. UDP mode serves/sends over QUIC/HTTP3 (https),
+        # Inter-node message transport. "https"/"http3" send over TLS (https scheme),
         # verifying peers only when an explicit certfile is configured. The local uav_api
         # connection above always stays on plain HTTP regardless of this setting.
-        self._udp = runner_configuration.udp
+        self._comm_protocol = runner_configuration.communication_protocol
         self._peer_certfile = runner_configuration.certfile
+        # SSL object for the https client (shared aiohttp session); False disables verification.
+        self._peer_ssl = ssl.create_default_context(cafile=self._peer_certfile) if self._peer_certfile else False
         self._h3_session = None
 
     def set_timer_callback(self, callback: Callable[[str], None]) -> None:
@@ -53,9 +56,9 @@ class EmbeddedProvider(IProvider):
         except Exception as e:
             self._logger.error(f"GET {url} failed: {e}")
 
-    async def _post(self, url: str, json: dict) -> None:
+    async def _post(self, url: str, json: dict, ssl=None) -> None:
         try:
-            async with self._session.post(url, json=json) as resp:
+            async with self._session.post(url, json=json, ssl=ssl) as resp:
                 if resp.status != 200:
                     body = await resp.text()
                     self._logger.error(f"POST {url} returned {resp.status}: {body}")
@@ -63,10 +66,15 @@ class EmbeddedProvider(IProvider):
             self._logger.error(f"POST {url} failed: {e}")
 
     async def _send_to_peer(self, addr: str, payload: dict) -> None:
-        if not self._udp:
+        if self._comm_protocol == "http":
             await self._post(f"http://{addr}/message", payload)
             return
 
+        if self._comm_protocol == "https":
+            await self._post(f"https://{addr}/message", payload, ssl=self._peer_ssl)
+            return
+
+        # http3: lazily create a niquests HTTP/3 client session.
         if self._h3_session is None:
             import niquests
             self._h3_session = niquests.AsyncSession()

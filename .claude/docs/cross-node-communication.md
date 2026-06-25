@@ -27,20 +27,21 @@ The receiver's FastAPI route hands `payload.message` to the encapsulator, which 
 
 The server listens on `0.0.0.0:<port>` where `<port>` comes from `node_ip_dict[node_id]` for its own id. The same FastAPI app also exposes the `/protocol/setup` and `/protocol/start` endpoints (`→ .claude/docs/runtime-model.md`). It shares the asyncio loop with the rest of the runner — there is no separate thread.
 
-## Transport — TCP (default) vs UDP/HTTP3
+## Transport — http (default) vs https vs http3
 
-The message API runs over one of two transports, selected by `RunnerConfiguration.udp` (default `False`). The FastAPI app, the `/message` route, and the wire payload are **identical** in both modes; only the server and client transport change. `udp` must be the same on every node.
+The message API runs over one of three transports, selected by `RunnerConfiguration.communication_protocol` (default `"http"`). The FastAPI app, the `/message` route, and the wire payload are **identical** in every mode; only the server and client transport change. `communication_protocol` must be the same on every node.
 
-| | `udp=False` (default) | `udp=True` |
-|---|---|---|
-| Server | uvicorn, HTTP/1.1 over TCP | Hypercorn `quic_bind`, HTTP/3 over QUIC (UDP), TLS 1.3 |
-| Peer URL scheme | `http://<addr>/message` | `https://<addr>/message` |
-| Client | shared `aiohttp.ClientSession` | lazily-created `niquests.AsyncSession` |
-| Deps | core install | `pip install "gradys-embedded[udp]"` |
+| | `"http"` (default) | `"https"` | `"http3"` |
+|---|---|---|---|
+| Server | uvicorn, HTTP/1.1 over TCP | uvicorn, HTTP/1.1 over TLS (TCP) | Hypercorn `quic_bind`, HTTP/3 over QUIC (UDP), TLS 1.3 |
+| Peer URL scheme | `http://<addr>/message` | `https://<addr>/message` | `https://<addr>/message` |
+| Client | shared `aiohttp.ClientSession` | shared `aiohttp.ClientSession` (per-request `ssl=`) | lazily-created `niquests.AsyncSession` |
+| TLS | none | TLS 1.2/1.3 | TLS 1.3 (QUIC-mandated) |
+| Deps | core install | core install | `pip install "gradys-embedded[http3]"` |
 
-QUIC mandates TLS, so the UDP server must present a certificate. If `certfile`/`keyfile` are set in the configuration, the server binds with them and the client **verifies peers against `certfile`**. If they are omitted, the server binds with an **ephemeral self-signed certificate generated at boot** (temp file, not persisted) and the client sets `verify=False` — the channel is still encrypted, but peers are not authenticated. See `→ .claude/docs/configuration.md`.
+`"https"` and `"http3"` both require the server to present a certificate. If `certfile`/`keyfile` are set in the configuration, the server binds with them and the client **verifies peers against `certfile`**. If they are omitted, the server binds with an **ephemeral self-signed certificate generated at boot** (temp file, not persisted) and the client disables verification (`ssl=False` for https, `verify=False` for http3) — the channel is still encrypted, but peers are not authenticated. See `→ .claude/docs/configuration.md`.
 
-The local `uav_api` connection is unaffected by `udp`; it always uses plain HTTP on `localhost`.
+The local `uav_api` connection is unaffected by `communication_protocol`; it always uses plain HTTP on `localhost`.
 
 **Until `/protocol/start` has succeeded, `/message` returns 409.** uvicorn binds the port from the moment `start_api()` runs, but the encapsulator that owns `handle_packet` only exists after start. Peers that broadcast during their own `initialize` may see this 409 on receivers that have not started yet.
 
@@ -55,7 +56,7 @@ self.provider.send_communication_command(
 The provider:
 
 1. Looks up `node_ip_dict[3]` → `"192.168.1.12:5000"` (for example).
-2. Fire-and-forgets a POST to `http://192.168.1.12:5000/message` (or `https://` under `udp=True`) with body `{"message": "hello", "source": <my_id>}`, via `_send_to_peer`.
+2. Fire-and-forgets a POST to `http://192.168.1.12:5000/message` (or `https://` under `"https"`/`"http3"`) with body `{"message": "hello", "source": <my_id>}`, via `_send_to_peer`.
 
 Failure modes:
 
@@ -106,7 +107,7 @@ def _fire_and_forget(self, coro) -> None:
 
 ## Security model — there isn't one
 
-`/message` has no authentication and no rate limiting. In the default TCP mode there is no TLS either (plain HTTP). UDP/HTTP3 mode (`udp=True`) encrypts the channel with QUIC's mandatory TLS, but with the default ephemeral cert it does **not** authenticate peers (client `verify=False`) — set a shared `certfile`/`keyfile` across the fleet to get peer authentication. Either way, anyone reachable on the network can POST to `/message` and inject messages. Deploy on a private fleet network.
+`/message` has no authentication and no rate limiting. In the default `"http"` mode there is no TLS either (plain HTTP). The `"https"` and `"http3"` modes encrypt the channel with TLS, but with the default ephemeral cert they do **not** authenticate peers (client verification disabled) — set a shared `certfile`/`keyfile` across the fleet to get peer authentication. Either way, anyone reachable on the network can POST to `/message` and inject messages. Deploy on a private fleet network.
 
 If you need authentication, wrap the payload in a signed envelope at the protocol level; the transport layer does not help you.
 

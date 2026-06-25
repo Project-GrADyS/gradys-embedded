@@ -13,12 +13,12 @@ class RunnerConfiguration:
     initial_position: tuple[float, float, float]
     uav_api_port: int
     telemetry_interval: float = 0.5
-    udp: bool = False
+    communication_protocol: str = "http"
     certfile: str | None = None
     keyfile: str | None = None
 ```
 
-All fields except `telemetry_interval`, `udp`, `certfile`, and `keyfile` are required. There is no validation beyond type hints; the runner will fail at runtime (usually inside the `POST /protocol/setup` handler) if values are incoherent.
+All fields except `telemetry_interval`, `communication_protocol`, `certfile`, and `keyfile` are required. There is no validation beyond type hints; the runner will fail at runtime (usually inside the `POST /protocol/setup` handler) if values are incoherent.
 
 ## Per-node fields
 
@@ -92,13 +92,19 @@ The port of the local `uav_api` HTTP server. Typically `8000` on every drone, bu
 
 Seconds between GPS polls. Default 0.5 s is a reasonable balance between responsiveness and load. Lower it for fast-moving platforms or tight waypoint tolerance; raise it for slow traversals or weak links. Tuning notes in `→ .claude/docs/mobility-and-telemetry.md` which covers the telemetry loop and failure handling.
 
-### `udp: bool = False`
+### `communication_protocol: str = "http"`
 
-Selects the inter-node message-API transport: `False` (default) serves it over HTTP/TCP via uvicorn; `True` serves it over QUIC/HTTP3 (UDP) via Hypercorn. **This is a fleet-wide invariant** — every node must use the same value, like `origin_gps_coordinates`. Enabling it requires the optional deps: `pip install "gradys-embedded[udp]"`. It does not affect the local `uav_api` connection, which always uses plain HTTP on `localhost`. Full transport comparison: `→ .claude/docs/cross-node-communication.md`.
+Selects the inter-node message-API transport. One of:
+
+- `"http"` (default) — HTTP/1.1 over TCP via uvicorn, plain (no TLS).
+- `"https"` — HTTP/1.1 over TLS via uvicorn, using `certfile`/`keyfile` (or an ephemeral self-signed cert).
+- `"http3"` — HTTP/3 over QUIC (UDP) via Hypercorn, TLS 1.3; requires the optional deps `pip install "gradys-embedded[http3]"`.
+
+Invalid values raise `ValueError` at construction. **This is a fleet-wide invariant** — every node must use the same value, like `origin_gps_coordinates`; mixed transports cannot interoperate. It does not affect the local `uav_api` connection, which always uses plain HTTP on `localhost`. Full transport comparison: `→ .claude/docs/cross-node-communication.md`.
 
 ### `certfile: str | None = None` / `keyfile: str | None = None`
 
-TLS material for `udp=True` (ignored when `udp=False`). QUIC requires the server to present a certificate:
+TLS material for `"https"` and `"http3"` (ignored when `communication_protocol == "http"`). Both modes require the server to present a certificate:
 
 - **Both provided** — the server binds with them, and the client verifies peers against `certfile`. For mutual authentication, distribute the **same** cert/key to every node (another fleet-wide invariant).
 - **Omitted** — the server binds with an ephemeral self-signed cert generated at boot (temp file, not persisted), and the client disables verification (`verify=False`). The channel is encrypted but peers are unauthenticated.

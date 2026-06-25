@@ -24,12 +24,13 @@ cd gradys-embedded
 pip install -e .
 ```
 
-**Dependencies:** `fastapi`, `uvicorn`, `aiohttp`, `pydantic`.
+**Dependencies:** `fastapi`, `uvicorn`, `aiohttp`, `pydantic`, `cryptography`.
 
-HTTP/3 (QUIC) message transport (`udp=True`) is an optional extra:
+The `http` and `https` message transports work with the core install. The HTTP/3 (QUIC)
+transport (`communication_protocol="http3"`) needs an optional extra:
 
 ```bash
-pip install "gradys-embedded[udp]"   # adds hypercorn[h3], niquests, cryptography
+pip install "gradys-embedded[http3]"   # adds hypercorn[h3], niquests
 ```
 
 ## Quick Start
@@ -120,28 +121,30 @@ The `RunnerConfiguration` dataclass controls how the runner connects to the UAV 
 | `origin_gps_coordinates` | `tuple[float, float, float] \| None` | `None` | Reference GPS point `(latitude, longitude, altitude)` used as the origin for converting between GPS and cartesian coordinates. All nodes in the network must share the same origin. If `None`, the drone's current position at boot is used. |
 | `x_axis_degrees` | `float \| None` | `None` | Clockwise rotation of the protocol's x-axis from true north, in degrees (`0.0` keeps the NEU convention: x=North, y=East). Must be identical on every node. If `None`, it is taken from the drone's heading at boot. |
 | `telemetry_interval` | `float` | `0.5` | Seconds between GPS telemetry polls from the UAV API. Lower values give more responsive position updates but increase load on the UAV API. |
-| `udp` | `bool` | `False` | Serve the inter-node message API over QUIC/HTTP3 (UDP) via Hypercorn instead of HTTP/TCP via uvicorn. Must be identical on every node. Does not affect the local UAV API connection, which is always plain HTTP on `localhost`. See [Message Transport](#message-transport-tcp-vs-http3-quic). |
-| `certfile` | `str \| None` | `None` | TLS certificate (PEM) for the QUIC server in `udp` mode; also used as the client trust anchor to verify peers. If `None`, an ephemeral self-signed certificate is generated at boot and peer verification is disabled. Ignored when `udp` is `False`. |
-| `keyfile` | `str \| None` | `None` | TLS private key (PEM) paired with `certfile`. Required when `certfile` is provided. Ignored when `udp` is `False` or `certfile` is `None`. |
+| `communication_protocol` | `str` | `"http"` | Inter-node message-API transport: `"http"` (HTTP/1.1 over TCP via uvicorn), `"https"` (HTTP/1.1 over TLS via uvicorn), or `"http3"` (HTTP/3 over QUIC via Hypercorn). Must be identical on every node. Does not affect the local UAV API connection, which is always plain HTTP on `localhost`. See [Message Transport](#message-transport-http-vs-https-vs-http3). |
+| `certfile` | `str \| None` | `None` | TLS certificate (PEM) for the server in `"https"`/`"http3"` modes; also used as the client trust anchor to verify peers. If `None`, an ephemeral self-signed certificate is generated at boot and peer verification is disabled. Ignored when `communication_protocol` is `"http"`. |
+| `keyfile` | `str \| None` | `None` | TLS private key (PEM) paired with `certfile`. Required when `certfile` is provided. Ignored when `communication_protocol` is `"http"` or `certfile` is `None`. |
 
-## Message Transport: TCP vs HTTP/3 (QUIC)
+## Message Transport: http vs https vs http3
 
-The inter-node message API runs over one of two transports, selected by the `udp`
-configuration flag. By default (`udp=False`) it is served as HTTP/1.1 over TCP via
-uvicorn. Set `udp=True` to serve it as HTTP/3 over QUIC via Hypercorn instead. The
-FastAPI app, the `/message` route, and the JSON payload are **identical** in both
-modes — only the transport changes. `udp` must be the same on every node; nodes using
-different transports cannot talk to each other.
+The inter-node message API runs over one of three transports, selected by the
+`communication_protocol` configuration field. By default (`"http"`) it is served as
+HTTP/1.1 over TCP via uvicorn. `"https"` serves it as HTTP/1.1 over TLS via uvicorn, and
+`"http3"` serves it as HTTP/3 over QUIC via Hypercorn. The FastAPI app, the `/message`
+route, and the JSON payload are **identical** in every mode — only the transport changes.
+`communication_protocol` must be the same on every node; nodes using different transports
+cannot talk to each other.
 
-| | `udp=False` (default) | `udp=True` |
-|---|---|---|
-| Server | uvicorn, HTTP/1.1 over TCP | Hypercorn `quic_bind`, HTTP/3 over QUIC (UDP), TLS 1.3 |
-| Peer URL scheme | `http://<addr>/message` | `https://<addr>/message` |
-| Client | shared `aiohttp.ClientSession` | `niquests.AsyncSession` |
-| Dependencies | core install | `pip install "gradys-embedded[udp]"` |
+| | `"http"` (default) | `"https"` | `"http3"` |
+|---|---|---|---|
+| Server | uvicorn, HTTP/1.1 over TCP | uvicorn, HTTP/1.1 over TLS (TCP) | Hypercorn `quic_bind`, HTTP/3 over QUIC (UDP), TLS 1.3 |
+| Peer URL scheme | `http://<addr>/message` | `https://<addr>/message` | `https://<addr>/message` |
+| Client | shared `aiohttp.ClientSession` | shared `aiohttp.ClientSession` | `niquests.AsyncSession` |
+| TLS | none | TLS 1.2/1.3 | TLS 1.3 (mandatory) |
+| Dependencies | core install | core install | `pip install "gradys-embedded[http3]"` |
 
-The local UAV API connection is unaffected by `udp`; it always uses plain HTTP on
-`localhost`.
+The local UAV API connection is unaffected by `communication_protocol`; it always uses
+plain HTTP on `localhost`.
 
 ### How HTTP/3 and QUIC work
 
@@ -161,12 +164,13 @@ The local UAV API connection is unaffected by `udp`; it always uses plain HTTP o
 
 ### TLS and certificates
 
-Because QUIC requires TLS, the `udp=True` server always presents a certificate:
+Both the `"https"` and `"http3"` servers present a certificate (QUIC mandates TLS; the
+uvicorn HTTPS server is configured with one too):
 
 - With `certfile`/`keyfile` set, the server binds with them and clients **verify peers**
   against `certfile`. Use the same pair across the fleet for authenticated channels.
 - If they are omitted, the server uses an **ephemeral self-signed certificate** generated
-  at boot and clients set `verify=False` — the channel is encrypted but peers are
+  at boot and clients disable verification — the channel is encrypted but peers are
   **not authenticated**.
 
 For the full transport and security details, see

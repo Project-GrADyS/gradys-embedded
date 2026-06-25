@@ -23,11 +23,22 @@ class RunnerConfiguration:
     telemetry_interval: float = 0.5
     """Seconds between telemetry polls"""
 
-    udp: bool = False
-    """Serve the inter-node message API over QUIC/HTTP3 (UDP) via Hypercorn instead of HTTP/TCP via uvicorn. TCP by default. Must be identical on every node in the fleet. Does not affect the local uav_api connection, which always uses plain HTTP on localhost."""
+    communication_protocol: str = "http"
+    """Transport for the inter-node message API. One of:
+    - "http" (default): HTTP/1.1 over TCP via uvicorn, plain (no TLS).
+    - "https": HTTP/1.1 over TLS via uvicorn, using certfile/keyfile (or an ephemeral self-signed cert).
+    - "http3": HTTP/3 over QUIC (UDP) via Hypercorn, TLS 1.3; requires `pip install "gradys-embedded[http3]"`.
+    Must be identical on every node in the fleet — mixed transports cannot interoperate. Unrelated to uav_api's own --udp flag; the local uav_api connection always uses plain HTTP on localhost."""
 
     certfile: str | None = None
-    """TLS certificate (PEM) for the QUIC server in udp mode. When set, it is also used as the client trust anchor to verify peers. If None, the server binds with an ephemeral self-signed certificate generated at boot and client-side peer verification is disabled. Ignored when udp is False."""
+    """TLS certificate (PEM) for the message-API server in "https" and "http3" modes. When set, it is also used as the client trust anchor to verify peers. If None, the server binds with an ephemeral self-signed certificate generated at boot and client-side peer verification is disabled. Ignored when communication_protocol is "http"."""
 
     keyfile: str | None = None
-    """TLS private key (PEM) paired with certfile. Required when certfile is provided. Ignored when udp is False or when certfile is None."""
+    """TLS private key (PEM) paired with certfile. Required when certfile is provided. Ignored when communication_protocol is "http" or when certfile is None."""
+
+    def __post_init__(self) -> None:
+        valid = {"http", "https", "http3"}
+        if self.communication_protocol not in valid:
+            raise ValueError(
+                f"Invalid communication_protocol {self.communication_protocol!r}; must be one of {sorted(valid)}"
+            )

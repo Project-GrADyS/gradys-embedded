@@ -33,7 +33,7 @@ class EmbeddedRunner:
         self._loop = asyncio.new_event_loop()
         asyncio.set_event_loop(self._loop)
 
-        self._loop.create_task(self._serve_api())
+        self._loop.create_task(self._serve_communication())
 
         try:
             self._loop.run_forever()
@@ -66,7 +66,7 @@ class EmbeddedRunner:
             self._configuration.x_axis_degrees = float(info["heading"])
             self._logger.info(f"x_axis_degrees set to: {self._configuration.x_axis_degrees}")
 
-    async def _serve_api(self) -> None:
+    async def _serve_communication(self) -> None:
         self._session = aiohttp.ClientSession()
 
         await self._ensure_origin_and_heading()
@@ -76,24 +76,43 @@ class EmbeddedRunner:
         port = int(port_str)
 
         app = create_app(self)
-        if self._configuration.udp:
-            await self._serve_udp(app, port)
+        protocol = self._configuration.communication_protocol
+        if protocol == "http":
+            await self._serve_http(app, port)
+        elif protocol == "https":
+            await self._serve_https(app, port)
+        elif protocol == "http3":
+            await self._serve_http3(app, port)
         else:
-            config = uvicorn.Config(app, host="0.0.0.0", port=port, loop="asyncio")
-            server = uvicorn.Server(config)
-            await server.serve()
+            raise ValueError(f"Invalid communication_protocol {protocol!r}")
 
-    async def _serve_udp(self, app, port: int) -> None:
-        from hypercorn.config import Config
-        from hypercorn.asyncio import serve
-
-        from gradys_embedded.runner.certs import generate_self_signed_cert
-
+    def _resolve_tls_material(self) -> tuple[str, str]:
+        """Return (certfile, keyfile) from configuration, or generate an ephemeral self-signed pair."""
         certfile = self._configuration.certfile
         keyfile = self._configuration.keyfile
         if certfile is None or keyfile is None:
+            from gradys_embedded.runner.certs import generate_self_signed_cert
+
             certfile, keyfile = generate_self_signed_cert()
-            self._logger.info("No TLS cert provided; using an ephemeral self-signed certificate for the QUIC server")
+            self._logger.info("No TLS cert provided; using an ephemeral self-signed certificate for the message-API server")
+        return certfile, keyfile
+
+    async def _serve_http(self, app, port: int) -> None:
+        config = uvicorn.Config(app, host="0.0.0.0", port=port, loop="asyncio")
+        server = uvicorn.Server(config)
+        await server.serve()
+
+    async def _serve_https(self, app, port: int) -> None:
+        certfile, keyfile = self._resolve_tls_material()
+        config = uvicorn.Config(app, host="0.0.0.0", port=port, loop="asyncio", ssl_certfile=certfile, ssl_keyfile=keyfile)
+        server = uvicorn.Server(config)
+        await server.serve()
+
+    async def _serve_http3(self, app, port: int) -> None:
+        from hypercorn.config import Config
+        from hypercorn.asyncio import serve
+
+        certfile, keyfile = self._resolve_tls_material()
 
         config = Config()
         config.bind = [f"0.0.0.0:{port}"]

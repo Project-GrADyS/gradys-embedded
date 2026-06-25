@@ -27,14 +27,14 @@ POST /message          → inter-node delivery (always available; 409 if /protoc
 4. `self._loop.run_forever()` — blocks until `KeyboardInterrupt`.
 5. `finally`: `encapsulator.finish()` if the protocol was started; close the aiohttp session; close the loop.
 
-`_serve_api()` is the task that boots HTTP:
+`_serve_communication()` is the task that boots HTTP:
 
 1. Creates `self._session = aiohttp.ClientSession()` on the runner-owned loop. Every subsequent HTTP call (setup, telemetry, peer sends) reuses this session.
 2. Resolves the bind port from `node_ip_dict[node_id]` (`"host:port"` parsed with `rsplit(":", 1)`).
 3. Builds the FastAPI app via `create_app(self)` — see below.
-4. `await uvicorn.Server(uvicorn.Config(app, host="0.0.0.0", port=port, loop="asyncio")).serve()`.
+4. Dispatches on `communication_protocol` to one of `_serve_http` (plain uvicorn), `_serve_https` (uvicorn with `ssl_certfile`/`ssl_keyfile`), or `_serve_http3` (Hypercorn over QUIC). All three `await server.serve()` and run for the process lifetime.
 
-Because `_serve_api` creates the session **before** awaiting `serve()`, by the time uvicorn binds and starts accepting requests the session is already attached to the runner. Endpoint handlers can rely on `runner._session` being non-None.
+Because `_serve_communication` creates the session **before** awaiting `serve()`, by the time the server binds and starts accepting requests the session is already attached to the runner. Endpoint handlers can rely on `runner._session` being non-None.
 
 ## The unified FastAPI app
 
