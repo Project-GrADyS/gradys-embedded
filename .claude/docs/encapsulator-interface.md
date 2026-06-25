@@ -28,9 +28,9 @@ Identical shape to the simulator's `PythonEncapsulator` — the same protocol cl
 
 ```python
 class EmbeddedEncapsulator(IEncapsulator):
-    def __init__(self, runner_configuration, loop, session):
+    def __init__(self, runner_configuration, loop, session, backend=None):
         self.provider = EmbeddedProvider(
-            runner_configuration, loop, self.handle_timer, session,
+            runner_configuration, loop, self.handle_timer, session, backend=backend,
         )
 
     def encapsulate(self, protocol: Type[IProtocol]) -> None:
@@ -57,19 +57,20 @@ That is why `encapsulate` ends with `self.provider.set_timer_callback(self.handl
 ### Constructor — what it captures
 
 ```python
-def __init__(self, runner_configuration, loop, timer_callback, session):
+def __init__(self, runner_configuration, loop, timer_callback, session, backend=None):
     self.node_id = runner_configuration.node_id
     self.node_ip_dict = runner_configuration.node_ip_dict
     self.origin_gps_coordinates = runner_configuration.origin_gps_coordinates
     self._timer_callback = timer_callback
-    self._session = session              # shared aiohttp ClientSession
+    self._session = session              # shared aiohttp ClientSession (uav_api + http transports)
+    self._backend = backend              # CommunicationBackend for inter-node SEND/BROADCAST
     self.tracked_variables = {}          # plain dict
     self._loop = loop                    # asyncio loop owned by EmbeddedRunner
     self._uav_base_url = f"http://localhost:{runner_configuration.uav_api_port}"
     self._timers: dict[str, asyncio.TimerHandle] = {}
 ```
 
-The provider never owns the loop or the session — both are handed in by `EmbeddedRunner` so shutdown is centralized.
+The provider never owns the loop or the session — both are handed in by `EmbeddedRunner` so shutdown is centralized. Inter-node sends are delegated to `self._backend` (`send_communication_command` calls `backend.send`/`broadcast`); the transport-specific code lives in `gradys_embedded/communication/`, not the provider.
 
 ### Fire-and-forget helper
 
@@ -79,7 +80,7 @@ def _fire_and_forget(self, coro) -> None:
     task.add_done_callback(self._log_task_exception)
 ```
 
-Used for every outbound HTTP call (communication and mobility). The calling protocol method returns immediately; any exception inside the task is logged but does not propagate. Details of the consequences for delivery guarantees: `→ .claude/docs/cross-node-communication.md` which covers peer HTTP, and `→ .claude/docs/mobility-and-telemetry.md` which covers mobility endpoints.
+The provider uses this for mobility commands; the HTTP backend has an identical helper for peer sends. The calling protocol method returns immediately; any exception inside the task is logged but does not propagate. Details of the consequences for delivery guarantees: `→ .claude/docs/cross-node-communication.md` which covers peer messaging, and `→ .claude/docs/mobility-and-telemetry.md` which covers mobility endpoints.
 
 ### Timer scheduling — asyncio, not a heap
 

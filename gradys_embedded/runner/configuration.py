@@ -35,13 +35,14 @@ class RunnerConfiguration:
     - "http" (default): HTTP/1.1 over TCP via uvicorn, plain (no TLS).
     - "https": HTTP/1.1 over TLS via uvicorn, using certfile/keyfile (or an ephemeral self-signed cert).
     - "http3": HTTP/3 over QUIC (UDP) via Hypercorn, TLS 1.3; requires `pip install "gradys-embedded[http3]"`.
-    - "zenoh": Eclipse Zenoh pub/sub in peer (p2p) mode; requires `pip install "gradys-embedded[zenoh]"`. See `auto_scout`.
+    - "zenoh_tcp": Eclipse Zenoh pub/sub in peer (p2p) mode over TCP links (no TLS); requires `pip install "gradys-embedded[zenoh]"`. See `auto_scout`.
+    - "zenoh_quic": Eclipse Zenoh pub/sub in peer (p2p) mode over QUIC links (TLS 1.3); requires `pip install "gradys-embedded[zenoh]"`. Needs a fleet-wide shared certfile/keyfile (identical on every node) for multi-node operation — see certfile. See `auto_scout`.
     Must be identical on every node in the fleet — mixed transports cannot interoperate. Unrelated to uav_api's own --udp flag; the local uav_api connection always uses plain HTTP on localhost."""
 
     auto_scout: bool = False
     """Whether nodes discover each other automatically instead of using the static `node_ip_dict`.
 
-    Only implemented for `communication_protocol == "zenoh"`:
+    Only implemented for the zenoh transports (`zenoh_tcp`, `zenoh_quic`):
     - False (default): Zenoh peer mode with multicast disabled and explicit `connect.endpoints`
       built from `node_ip_dict` (works on multicast-blocked LANs; keeps `node_ip_dict` authoritative).
     - True: Zenoh peer mode using default UDP multicast scouting (224.0.0.224:7446); peers
@@ -50,22 +51,29 @@ class RunnerConfiguration:
     but ignored for them."""
 
     certfile: str | None = None
-    """TLS certificate (PEM) for the message-API server in "https" and "http3" modes. When set, it is also used as the client trust anchor to verify peers. If None, the server binds with an ephemeral self-signed certificate generated at boot and client-side peer verification is disabled. Ignored when communication_protocol is "http"."""
+    """TLS certificate (PEM). Used by "https"/"http3" (message-API server identity) and by
+    "zenoh_quic" (QUIC TLS link identity AND fleet trust anchor — name verification is disabled so
+    IP-addressed endpoints work). For "https"/"http3" it is also the client trust anchor to verify
+    peers. If None, an ephemeral self-signed certificate is generated at boot: harmless for
+    "https"/"http3" (client verification is then disabled), but for "zenoh_quic" peers on other
+    nodes will NOT trust each other — so a fleet-wide shared certfile/keyfile is effectively required
+    for multi-node "zenoh_quic" (gradys-sitl-tester auto-generates one shared pair). Ignored when
+    communication_protocol is "http" or "zenoh_tcp"."""
 
     keyfile: str | None = None
-    """TLS private key (PEM) paired with certfile. Required when certfile is provided. Ignored when communication_protocol is "http" or when certfile is None."""
+    """TLS private key (PEM) paired with certfile. Required when certfile is provided. Ignored when communication_protocol is "http"/"zenoh_tcp" or when certfile is None."""
 
     def __post_init__(self) -> None:
-        valid = {"http", "https", "http3", "zenoh"}
+        valid = {"http", "https", "http3", "zenoh_tcp", "zenoh_quic"}
         if self.communication_protocol not in valid:
             raise ValueError(
                 f"Invalid communication_protocol {self.communication_protocol!r}; must be one of {sorted(valid)}"
             )
-        if self.auto_scout and self.communication_protocol != "zenoh":
+        if self.auto_scout and self.communication_protocol not in ("zenoh_tcp", "zenoh_quic"):
             import logging
 
             logging.getLogger(__name__).warning(
                 "auto_scout=True has no effect for communication_protocol=%r; it is only "
-                "implemented for 'zenoh'. Ignoring.",
+                "implemented for the zenoh transports. Ignoring.",
                 self.communication_protocol,
             )

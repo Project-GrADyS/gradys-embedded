@@ -1,30 +1,18 @@
+"""Control-panel HTTP app (`/protocol/*`).
+
+The inter-node data-plane `/message` endpoint lives with the HTTP transport in
+`gradys_embedded/communication/http.py`; this module owns only the control panel, which is always
+served over plain HTTP on `control_api_port` regardless of `communication_protocol`.
+"""
+
 from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
 from fastapi import APIRouter, FastAPI, HTTPException
-from pydantic import BaseModel
 
 if TYPE_CHECKING:
     from gradys_embedded.runner.runner import EmbeddedRunner
-
-
-class MessagePayload(BaseModel):
-    message: str
-    source: int
-
-
-def _build_message_router(runner: "EmbeddedRunner") -> APIRouter:
-    router = APIRouter()
-
-    @router.post("/message")
-    async def receive_message(payload: MessagePayload):
-        if runner._encapsulator is None:
-            raise HTTPException(status_code=409, detail="Protocol not started")
-        runner._encapsulator.handle_packet(payload.message)
-        return {"status": "ok"}
-
-    return router
 
 
 def _build_protocol_router(runner: "EmbeddedRunner") -> APIRouter:
@@ -53,20 +41,8 @@ def _build_protocol_router(runner: "EmbeddedRunner") -> APIRouter:
     return router
 
 
-def create_message_app(runner: "EmbeddedRunner") -> FastAPI:
-    """Data-plane app: the inter-node `/message` endpoint only.
-
-    Served on the node's message port (`node_ip_dict[node_id]`) by the selected
-    `communication_protocol` transport. Kept separate from the control plane so the
-    message port belongs entirely to the data plane (notably, so Zenoh's transport can
-    own that port without colliding with a uvicorn control server)."""
-    app = FastAPI()
-    app.include_router(_build_message_router(runner))
-    return app
-
-
 def create_control_app(runner: "EmbeddedRunner") -> FastAPI:
-    """Control-plane app: the `/protocol/setup` + `/protocol/start` endpoints only.
+    """Control-panel app: the `/protocol/setup` + `/protocol/start` endpoints only.
 
     Served over plain HTTP on `control_api_port` for every transport, independently of
     `communication_protocol`. This is the surface an operator drives to bring a drone up."""

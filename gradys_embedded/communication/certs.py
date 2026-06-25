@@ -1,20 +1,23 @@
-"""Ephemeral TLS certificate generation for the TLS message-API server ("https" and "http3" modes).
+"""TLS certificate material for transports that require it.
 
-Both the "https" (uvicorn over TLS) and "http3" (Hypercorn over QUIC, which mandates TLS 1.3)
-transports require the message-API server to present a certificate. When the operator does not
-supply one via ``RunnerConfiguration``, the runner generates a throwaway self-signed certificate
-at boot. It is written to temporary files for the server to read and is never reused across runs
-nor used as a client trust anchor — peer verification stays disabled unless an explicit
-``certfile`` is configured.
+Used by the "https" and "http3" message-API servers (which mandate TLS) and by the
+"zenoh_quic" transport (Zenoh QUIC mandates TLS 1.3). When the operator does not supply a
+certificate via ``RunnerConfiguration``, an ephemeral self-signed pair is generated at boot.
+
+For "https"/"http3" the ephemeral cert is harmless because client-side peer verification stays
+disabled. For "zenoh_quic" it is NOT sufficient for multi-node operation: QUIC always verifies the
+listener's cert against a ``root_ca_certificate``, so every node must share the SAME cert — see
+``communication/zenoh.py`` for the loud warning emitted when one is missing.
 """
 
 import datetime
 import ipaddress
+import logging
 import tempfile
 
 
 def generate_self_signed_cert() -> tuple[str, str]:
-    """Generate an ephemeral self-signed cert/key pair and return their file paths.
+    """Generate a self-signed cert/key pair and return their file paths.
 
     The files live for the lifetime of the process (temp dir); they are intentionally not
     cached or cleaned up, mirroring the throwaway nature of the dev certificate.
@@ -64,3 +67,14 @@ def generate_self_signed_cert() -> tuple[str, str]:
         f.write(key_bytes)
 
     return cert_path, key_path
+
+
+def resolve_tls_material(configuration, logger: logging.Logger | None = None) -> tuple[str, str]:
+    """Return (certfile, keyfile) from configuration, or generate an ephemeral self-signed pair."""
+    certfile = configuration.certfile
+    keyfile = configuration.keyfile
+    if certfile is None or keyfile is None:
+        certfile, keyfile = generate_self_signed_cert()
+        if logger is not None:
+            logger.info("No TLS cert provided; using an ephemeral self-signed certificate")
+    return certfile, keyfile

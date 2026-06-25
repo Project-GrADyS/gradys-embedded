@@ -27,12 +27,12 @@ pip install -e .
 **Dependencies:** `fastapi`, `uvicorn`, `aiohttp`, `pydantic`, `cryptography`.
 
 The `http` and `https` message transports work with the core install. The HTTP/3 (QUIC)
-transport (`communication_protocol="http3"`) and the Zenoh transport
-(`communication_protocol="zenoh"`) each need an optional extra:
+transport (`communication_protocol="http3"`) and the Zenoh transports
+(`communication_protocol="zenoh_tcp"` or `"zenoh_quic"`) each need an optional extra:
 
 ```bash
 pip install "gradys-embedded[http3]"   # adds hypercorn[h3], niquests
-pip install "gradys-embedded[zenoh]"   # adds eclipse-zenoh (peer/p2p pub-sub)
+pip install "gradys-embedded[zenoh]"   # adds eclipse-zenoh (peer/p2p pub-sub; zenoh_tcp + zenoh_quic)
 ```
 
 ## Quick Start
@@ -102,7 +102,7 @@ runner.start_api()
   - `POST /protocol/setup` — arms the drone, takes off, and flies to `initial_position`.
   - `POST /protocol/start` — instantiates the protocol, calls `initialize()`, and starts the telemetry polling loop.
 - **Data plane** (the `node_ip_dict` port, transport per `communication_protocol`):
-  - `POST /message` — inter-node delivery for http/https/http3 (forwarded to `handle_packet`); under `"zenoh"` a Zenoh peer session carries messages instead.
+  - `POST /message` — inter-node delivery for http/https/http3 (forwarded to `handle_packet`); under `"zenoh_tcp"`/`"zenoh_quic"` a Zenoh peer session carries messages instead.
 
 After launching the runner, an external client (operator console, sitl-tester, `curl`) drives the drone end-to-end via the **control port**:
 
@@ -127,41 +127,52 @@ The `RunnerConfiguration` dataclass controls how the runner connects to the UAV 
 | `origin_gps_coordinates` | `tuple[float, float, float] \| None` | `None` | Reference GPS point `(latitude, longitude, altitude)` used as the origin for converting between GPS and cartesian coordinates. All nodes in the network must share the same origin. If `None`, the drone's current position at boot is used. |
 | `x_axis_degrees` | `float \| None` | `None` | Clockwise rotation of the protocol's x-axis from true north, in degrees (`0.0` keeps the NEU convention: x=North, y=East). Must be identical on every node. If `None`, it is taken from the drone's heading at boot. |
 | `telemetry_interval` | `float` | `0.5` | Seconds between GPS telemetry polls from the UAV API. Lower values give more responsive position updates but increase load on the UAV API. |
-| `communication_protocol` | `str` | `"http"` | Inter-node data-plane transport: `"http"` (HTTP/1.1 over TCP via uvicorn), `"https"` (HTTP/1.1 over TLS via uvicorn), `"http3"` (HTTP/3 over QUIC via Hypercorn), or `"zenoh"` (Eclipse Zenoh pub/sub in peer/p2p mode). Must be identical on every node. Does not affect the local UAV API connection, which is always plain HTTP on `localhost`. See [Message Transport](#message-transport-http-vs-https-vs-http3-vs-zenoh). |
+| `communication_protocol` | `str` | `"http"` | Inter-node data-plane transport: `"http"` (HTTP/1.1 over TCP via uvicorn), `"https"` (HTTP/1.1 over TLS via uvicorn), `"http3"` (HTTP/3 over QUIC via Hypercorn), `"zenoh_tcp"` (Eclipse Zenoh pub/sub in peer/p2p mode over TCP), or `"zenoh_quic"` (Zenoh pub/sub over QUIC/TLS 1.3). Must be identical on every node. Does not affect the local UAV API connection, which is always plain HTTP on `localhost`. See [Message Transport](#message-transport-http-vs-https-vs-http3-vs-zenoh_tcp-vs-zenoh_quic). |
 | `auto_scout` | `bool` | `False` | **Zenoh only.** `False` = explicit peer endpoints from `node_ip_dict` (multicast disabled). `True` = Zenoh UDP multicast scouting for automatic peer discovery. **No effect for `"http"`/`"https"`/`"http3"`** (accepted but ignored; a warning is logged). |
-| `certfile` | `str \| None` | `None` | TLS certificate (PEM) for the server in `"https"`/`"http3"` modes; also used as the client trust anchor to verify peers. If `None`, an ephemeral self-signed certificate is generated at boot and peer verification is disabled. Ignored when `communication_protocol` is `"http"` or `"zenoh"`. |
-| `keyfile` | `str \| None` | `None` | TLS private key (PEM) paired with `certfile`. Required when `certfile` is provided. Ignored when `communication_protocol` is `"http"` or `certfile` is `None`. |
+| `certfile` | `str \| None` | `None` | TLS certificate (PEM). For `"https"`/`"http3"`: the server cert, also the client trust anchor. For `"zenoh_quic"`: the QUIC TLS link identity **and** the fleet trust anchor — **must be the same on every node** (QUIC verifies peers against it). If `None`, an ephemeral self-signed cert is generated at boot (fine for https/http3 with verification disabled, but `zenoh_quic` peers will then reject each other — configure a shared pair). Ignored when `communication_protocol` is `"http"` or `"zenoh_tcp"`. |
+| `keyfile` | `str \| None` | `None` | TLS private key (PEM) paired with `certfile`. Required when `certfile` is provided. Ignored when `communication_protocol` is `"http"`/`"zenoh_tcp"` or `certfile` is `None`. |
 
-## Message Transport: http vs https vs http3 vs zenoh
+## Message Transport: http vs https vs http3 vs zenoh_tcp vs zenoh_quic
 
-The inter-node data plane runs over one of four transports, selected by the
+The inter-node data plane runs over one of five transports, selected by the
 `communication_protocol` configuration field. The three HTTP transports serve an identical
-FastAPI `/message` route and JSON payload — only the transport changes. The `"zenoh"`
-transport replaces request/response POSTs with Eclipse Zenoh pub/sub in peer (p2p) mode.
-`communication_protocol` must be the same on every node; nodes using different transports
-cannot talk to each other.
+FastAPI `/message` route and JSON payload — only the transport changes. The two `zenoh_*`
+transports replace request/response POSTs with Eclipse Zenoh pub/sub in peer (p2p) mode, and
+differ from each other only in link transport (TCP vs QUIC/TLS). `communication_protocol` must
+be the same on every node; nodes using different transports cannot talk to each other.
 
-| | `"http"` (default) | `"https"` | `"http3"` | `"zenoh"` |
-|---|---|---|---|---|
-| Model | request/response, IP-addressed | request/response, IP-addressed | request/response, IP-addressed | pub/sub, key-addressed, peer (p2p) |
-| Server | uvicorn, HTTP/1.1 over TCP | uvicorn, HTTP/1.1 over TLS (TCP) | Hypercorn `quic_bind`, HTTP/3 over QUIC (UDP), TLS 1.3 | Zenoh peer session + subscribers |
-| Addressing | `http://<addr>/message` | `https://<addr>/message` | `https://<addr>/message` | keys `gradys/msg/<dest_id>`, `gradys/msg/broadcast` |
-| Discovery | `node_ip_dict` | `node_ip_dict` | `node_ip_dict` | `node_ip_dict` or multicast (`auto_scout`) |
-| Dependencies | core install | core install | `pip install "gradys-embedded[http3]"` | `pip install "gradys-embedded[zenoh]"` |
+| | `"http"` (default) | `"https"` | `"http3"` | `"zenoh_tcp"` | `"zenoh_quic"` |
+|---|---|---|---|---|---|
+| Model | request/response, IP-addressed | request/response, IP-addressed | request/response, IP-addressed | pub/sub, key-addressed, peer (p2p) | pub/sub, key-addressed, peer (p2p) |
+| Server | uvicorn, HTTP/1.1 over TCP | uvicorn, HTTP/1.1 over TLS (TCP) | Hypercorn `quic_bind`, HTTP/3 over QUIC (UDP), TLS 1.3 | Zenoh peer session, **TCP** links | Zenoh peer session, **QUIC**/TLS 1.3 links |
+| Addressing | `http://<addr>/message` | `https://<addr>/message` | `https://<addr>/message` | keys `gradys/msg/<dest_id>`, `gradys/msg/broadcast` | keys `gradys/msg/<dest_id>`, `gradys/msg/broadcast` |
+| Discovery | `node_ip_dict` | `node_ip_dict` | `node_ip_dict` | `node_ip_dict` or multicast (`auto_scout`) | `node_ip_dict` or multicast (`auto_scout`) |
+| TLS | none | server cert | server cert | none | **mandatory; fleet-wide shared cert** |
+| Dependencies | core install | core install | `pip install "gradys-embedded[http3]"` | `pip install "gradys-embedded[zenoh]"` | `pip install "gradys-embedded[zenoh]"` |
 
 The local UAV API connection is unaffected by `communication_protocol`; it always uses
 plain HTTP on `localhost`.
 
-### Zenoh (peer / p2p) transport
+### Zenoh (peer / p2p) transports — `zenoh_tcp` and `zenoh_quic`
 
-With `communication_protocol="zenoh"`, each node opens one Zenoh session in `peer` mode and
-subscribes to its inbox `gradys/msg/<node_id>` and to `gradys/msg/broadcast`. SEND publishes
-to the destination's inbox key; BROADCAST is a **single** publish to the shared broadcast key
-(not an O(n) per-peer loop). The wire payload is the same JSON `{"message", "source"}` as the
-HTTP transports. Peer discovery is controlled by `auto_scout`:
+With `communication_protocol="zenoh_tcp"` or `"zenoh_quic"`, each node opens one Zenoh session
+in `peer` mode and subscribes to its inbox `gradys/msg/<node_id>` and to `gradys/msg/broadcast`.
+SEND publishes to the destination's inbox key; BROADCAST is a **single** publish to the shared
+broadcast key (not an O(n) per-peer loop). The wire payload is the same JSON `{"message",
+"source"}` as the HTTP transports. The two transports differ only in the link layer:
+
+- **`zenoh_tcp`** — `tcp/<ip:port>` links, no TLS.
+- **`zenoh_quic`** — `quic/<ip:port>` links over TLS 1.3. QUIC **mandates** TLS and verifies each
+  peer's certificate against a shared root CA (only hostname/SAN matching is disabled), so **every
+  node must share the same `certfile`/`keyfile`**. With the default ephemeral per-node cert, peers
+  reject each other and a warning is logged at boot — configure a shared pair (gradys-sitl-tester
+  auto-generates one for a local fleet).
+
+Peer discovery is controlled by `auto_scout` (same for both):
 
 - `auto_scout=False` (default): multicast disabled; the session connects to explicit
-  `tcp/<ip:port>` endpoints derived from `node_ip_dict`. Works on multicast-blocked LANs.
+  `tcp/<ip:port>` (or `quic/<ip:port>`) endpoints derived from `node_ip_dict`. Works on
+  multicast-blocked LANs.
 - `auto_scout=True`: Zenoh UDP multicast scouting (`224.0.0.224:7446`) auto-discovers peers;
   `node_ip_dict` is not needed for transport. Requires a multicast-capable network.
 
@@ -183,14 +194,17 @@ HTTP transports. Peer discovery is controlled by `auto_scout`:
 
 ### TLS and certificates
 
-Both the `"https"` and `"http3"` servers present a certificate (QUIC mandates TLS; the
-uvicorn HTTPS server is configured with one too):
+The `"https"`, `"http3"`, and `"zenoh_quic"` transports all use TLS (QUIC mandates it; the
+uvicorn HTTPS server is configured with a cert too):
 
-- With `certfile`/`keyfile` set, the server binds with them and clients **verify peers**
-  against `certfile`. Use the same pair across the fleet for authenticated channels.
-- If they are omitted, the server uses an **ephemeral self-signed certificate** generated
-  at boot and clients disable verification — the channel is encrypted but peers are
-  **not authenticated**.
+- **`"https"`/`"http3"`** — with `certfile`/`keyfile` set, the server binds with them and clients
+  **verify peers** against `certfile` (use the same pair fleet-wide for authenticated channels). If
+  omitted, the server uses an **ephemeral self-signed certificate** and clients disable verification
+  — encrypted but peers are **not authenticated**.
+- **`"zenoh_quic"`** — the cert is the QUIC link identity **and** the fleet trust anchor. QUIC always
+  verifies peers against it, so **every node must share the same `certfile`/`keyfile`**. With an
+  ephemeral per-node cert, peers reject each other (a warning is logged) and the fleet cannot
+  communicate; gradys-sitl-tester auto-generates one shared pair for a local fleet.
 
 For the full transport and security details, see
 [`.claude/docs/cross-node-communication.md`](.claude/docs/cross-node-communication.md).
@@ -231,11 +245,13 @@ GrADyS-Embedded is structured as a layered system that bridges protocol logic to
 
 **Provider** (`EmbeddedProvider`) -- The `IProvider` implementation that makes the protocol's abstract commands concrete:
 
-- **Communication commands** become HTTP POSTs (http/https/http3) or Zenoh publishes (`zenoh`). `SEND` targets a specific node (its `/message` endpoint, or key `gradys/msg/<id>`); `BROADCAST` reaches every other node (one POST per peer, or a single publish to `gradys/msg/broadcast`).
+- **Communication commands** are delegated to the configured `CommunicationBackend`. `SEND` targets a specific node (its `/message` endpoint, or key `gradys/msg/<id>`); `BROADCAST` reaches every other node (one POST per peer for HTTP, or a single publish to `gradys/msg/broadcast` for zenoh).
 - **Mobility commands** become HTTP calls to the local UAV API. `GOTO_COORDS` converts cartesian coordinates to GPS (using the configured origin) and calls `/movement/go_to_gps`. `GOTO_GEO_COORDS` calls the same endpoint directly. `SET_SPEED` calls `/command/set_air_speed`.
 - **Timers** use the asyncio event loop's `call_at` for scheduling.
 
-**Message API** -- Two FastAPI applications (`create_message_app`, `create_control_app`) served on two ports. The control app (`POST /protocol/setup`, `POST /protocol/start`) runs on `control_api_port` and drives the runner's lifecycle from outside the process. The message app (`POST /message`, forwarded to `handle_packet`) runs on the node's `node_ip_dict` port for the HTTP transports; under `"zenoh"` it is not served — a Zenoh peer session handles inter-node messaging instead.
+**Communication backends** (`gradys_embedded/communication/`) -- One `CommunicationBackend` per transport, built by `create_backend(runner)`. Each owns both the data-plane *serve* (receive) side and the *send*/*broadcast* side: `http.py` covers `http`/`https`/`http3` (the `/message` FastAPI app + peer POSTs), `zenoh.py` covers `zenoh_tcp`/`zenoh_quic` (Zenoh peer session, no `/message` server). `certs.py` provides TLS material.
+
+**Control API** (`gradys_embedded/runner/control_panel.py`) -- The `create_control_app` FastAPI application (`POST /protocol/setup`, `POST /protocol/start`) served on `control_api_port`, driving the runner's lifecycle from outside the process. Always plain HTTP, independent of `communication_protocol`. The `/message` data-plane app lives with the HTTP backend in `communication/http.py`.
 
 **Position Utilities** -- Functions for converting between GPS coordinates and a local cartesian frame (North-East-Up) using haversine distance calculations. All nodes must share the same `origin_gps_coordinates` so their cartesian frames are consistent.
 
@@ -245,7 +261,7 @@ GrADyS-Embedded is structured as a layered system that bridges protocol logic to
 
 **Mobility** -- When a protocol sends a mobility command through the provider, coordinates are converted from cartesian to GPS (if needed) and forwarded to the UAV API via HTTP.
 
-**Communication** -- When a protocol sends a message, the provider performs an HTTP POST to the destination node's message API (http/https/http3) or a Zenoh publish on the shared peer session (`zenoh`). On the receiving side, the FastAPI `/message` endpoint — or, for Zenoh, the subscriber callback marshalled onto the event loop — delivers the payload to the protocol's `handle_packet` method.
+**Communication** -- When a protocol sends a message, the provider delegates to the configured `CommunicationBackend`, which performs an HTTP POST to the destination node's message API (http/https/http3) or a Zenoh publish on the shared peer session (`zenoh_tcp`/`zenoh_quic`). On the receiving side, the FastAPI `/message` endpoint — or, for Zenoh, the subscriber callback marshalled onto the event loop — delivers the payload to the protocol's `handle_packet` method.
 
 ## License
 
