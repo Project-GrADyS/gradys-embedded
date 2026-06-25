@@ -10,7 +10,7 @@ from gradys_embedded.protocol.interface import IProtocol
 from gradys_embedded.protocol.messages.telemetry import Telemetry
 from gradys_embedded.protocol.position import cartesian_to_geo, geo_to_cartesian
 from gradys_embedded.runner.configuration import RunnerConfiguration
-from gradys_embedded.runner.message_api import create_app
+from gradys_embedded.runner.message_api import create_control_app, create_message_app
 
 
 class EmbeddedRunner:
@@ -23,6 +23,9 @@ class EmbeddedRunner:
         self._encapsulator: EmbeddedEncapsulator | None = None
         self._setup_done = False
         self._started = False
+        # Zenoh data-plane session (only when communication_protocol == "zenoh").
+        self._zenoh_session = None
+        self._zenoh_subscribers: list = []
 
     def start_api(self) -> None:
         logging.basicConfig(
@@ -44,6 +47,8 @@ class EmbeddedRunner:
                 self._encapsulator.finish()
             if self._session is not None:
                 self._loop.run_until_complete(self._session.close())
+            if self._zenoh_session is not None:
+                self._zenoh_session.close()
             self._loop.close()
 
     async def _ensure_origin_and_heading(self) -> None:
@@ -75,16 +80,25 @@ class EmbeddedRunner:
         _, port_str = own_addr.rsplit(":", 1)
         port = int(port_str)
 
-        app = create_app(self)
+        # Control plane (/protocol/*) and data plane (/message) run as two independent
+        # servers. The control plane is plain HTTP on control_api_port for every transport;
+        # the data plane owns the node_ip_dict port via the selected communication_protocol.
+        control_app = create_control_app(self)
+        message_app = create_message_app(self)
+
         protocol = self._configuration.communication_protocol
         if protocol == "http":
-            await self._serve_http(app, port)
+            data_plane = self._serve_http(message_app, port)
         elif protocol == "https":
-            await self._serve_https(app, port)
+            data_plane = self._serve_https(message_app, port)
         elif protocol == "http3":
-            await self._serve_http3(app, port)
+            data_plane = self._serve_http3(message_app, port)
+        elif protocol == "zenoh":
+            data_plane = self._serve_zenoh(port)
         else:
             raise ValueError(f"Invalid communication_protocol {protocol!r}")
+
+        await asyncio.gather(self._serve_control(control_app), data_plane)
 
     def _resolve_tls_material(self) -> tuple[str, str]:
         """Return (certfile, keyfile) from configuration, or generate an ephemeral self-signed pair."""
@@ -97,16 +111,84 @@ class EmbeddedRunner:
             self._logger.info("No TLS cert provided; using an ephemeral self-signed certificate for the message-API server")
         return certfile, keyfile
 
+    async def _run_uvicorn(self, config: uvicorn.Config) -> None:
+        server = uvicorn.Server(config)
+        # Several servers share this loop (control plane + data plane); let the runner's
+        # own KeyboardInterrupt handling own shutdown instead of each server racing to
+        # install process-wide signal handlers.
+        server.install_signal_handlers = lambda: None
+        await server.serve()
+
+    async def _serve_control(self, app) -> None:
+        config = uvicorn.Config(app, host="0.0.0.0", port=self._configuration.control_api_port, loop="asyncio")
+        await self._run_uvicorn(config)
+
     async def _serve_http(self, app, port: int) -> None:
         config = uvicorn.Config(app, host="0.0.0.0", port=port, loop="asyncio")
-        server = uvicorn.Server(config)
-        await server.serve()
+        await self._run_uvicorn(config)
 
     async def _serve_https(self, app, port: int) -> None:
         certfile, keyfile = self._resolve_tls_material()
         config = uvicorn.Config(app, host="0.0.0.0", port=port, loop="asyncio", ssl_certfile=certfile, ssl_keyfile=keyfile)
-        server = uvicorn.Server(config)
-        await server.serve()
+        await self._run_uvicorn(config)
+
+    def _build_zenoh_config(self, port: int):
+        """Build a Zenoh peer-mode Config. Option A (auto_scout) uses default multicast
+        scouting; Option B builds explicit connect.endpoints from node_ip_dict."""
+        import json
+
+        import zenoh
+
+        cfg = zenoh.Config()
+        cfg.insert_json5("mode", json.dumps("peer"))
+        if self._configuration.auto_scout:
+            # Option A: rely on Zenoh's default UDP multicast scouting for discovery.
+            return cfg
+
+        # Option B: no multicast; connect explicitly to peers listed in node_ip_dict.
+        cfg.insert_json5("scouting/multicast/enabled", "false")
+        cfg.insert_json5("scouting/gossip/enabled", "true")
+        own_addr = self._configuration.node_ip_dict[self._configuration.node_id]
+        own_ip = own_addr.rsplit(":", 1)[0]
+        cfg.insert_json5("listen/endpoints", json.dumps([f"tcp/{own_ip}:{port}"]))
+        connect = [
+            f"tcp/{addr}"
+            for nid, addr in self._configuration.node_ip_dict.items()
+            if nid != self._configuration.node_id
+        ]
+        cfg.insert_json5("connect/endpoints", json.dumps(connect))
+        return cfg
+
+    async def _serve_zenoh(self, port: int) -> None:
+        import json
+
+        import zenoh
+
+        self._zenoh_session = zenoh.open(self._build_zenoh_config(port))
+
+        def on_sample(sample) -> None:
+            # Runs on a Zenoh background thread — marshal onto the runner's event loop.
+            if self._encapsulator is None:
+                return  # protocol not started yet; drop, mirroring /message 409-before-start
+            try:
+                data = json.loads(bytes(sample.payload))
+                message = data["message"]
+            except Exception as e:
+                self._logger.error(f"Failed to decode zenoh message: {e}")
+                return
+            self._loop.call_soon_threadsafe(self._encapsulator.handle_packet, message)
+
+        node_id = self._configuration.node_id
+        self._zenoh_subscribers = [
+            self._zenoh_session.declare_subscriber(f"gradys/msg/{node_id}", on_sample),
+            self._zenoh_session.declare_subscriber("gradys/msg/broadcast", on_sample),
+        ]
+        self._logger.info(
+            f"Zenoh peer session open (auto_scout={self._configuration.auto_scout}); "
+            f"subscribed to gradys/msg/{node_id} and gradys/msg/broadcast"
+        )
+        # Keep the data plane alive for the lifetime of the runner.
+        await asyncio.Future()
 
     async def _serve_http3(self, app, port: int) -> None:
         from hypercorn.config import Config
@@ -143,7 +225,7 @@ class EmbeddedRunner:
         return True
 
     async def _bootstrap_protocol(self) -> None:
-        self._encapsulator = EmbeddedEncapsulator(self._configuration, self._loop, self._session)
+        self._encapsulator = EmbeddedEncapsulator(self._configuration, self._loop, self._session, zenoh_session=self._zenoh_session)
         self._encapsulator.encapsulate(self._protocol_class)
         self._encapsulator.initialize()
 

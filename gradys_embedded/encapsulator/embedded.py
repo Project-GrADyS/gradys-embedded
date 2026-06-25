@@ -20,7 +20,7 @@ class EmbeddedProvider(IProvider):
     calls into HTTP requests to the UAV API and inter-node message API.
     """
 
-    def __init__(self, runner_configuration: RunnerConfiguration, loop: asyncio.AbstractEventLoop, timer_callback: Callable[[str], None], session: aiohttp.ClientSession):
+    def __init__(self, runner_configuration: RunnerConfiguration, loop: asyncio.AbstractEventLoop, timer_callback: Callable[[str], None], session: aiohttp.ClientSession, zenoh_session=None):
         self.node_id = runner_configuration.node_id
         self.node_ip_dict = runner_configuration.node_ip_dict
         self.origin_gps_coordinates = runner_configuration.origin_gps_coordinates
@@ -43,6 +43,9 @@ class EmbeddedProvider(IProvider):
         # SSL object for the https client (shared aiohttp session); False disables verification.
         self._peer_ssl = ssl.create_default_context(cafile=self._peer_certfile) if self._peer_certfile else False
         self._h3_session = None
+        # Shared Zenoh session (used only when communication_protocol == "zenoh"). Opened and
+        # owned by the runner; the subscriber side lives there, this side only publishes.
+        self._zenoh_session = zenoh_session
 
     def set_timer_callback(self, callback: Callable[[str], None]) -> None:
         self._timer_callback = callback
@@ -88,6 +91,15 @@ class EmbeddedProvider(IProvider):
         except Exception as e:
             self._logger.error(f"POST {url} failed: {e}")
 
+    def _zenoh_publish(self, key: str, payload: dict) -> None:
+        # Zenoh put is a fast local enqueue; failures are logged, never raised (fire-and-forget).
+        try:
+            import json
+
+            self._zenoh_session.put(key, json.dumps(payload).encode())
+        except Exception as e:
+            self._logger.error(f"Zenoh put to {key!r} failed: {e}")
+
     def _fire_and_forget(self, coro) -> None:
         task = self._loop.create_task(coro)
         task.add_done_callback(self._log_task_exception)
@@ -105,18 +117,21 @@ class EmbeddedProvider(IProvider):
             if dest_addr is None:
                 self._logger.warning(f"Unknown destination node {command.destination}")
                 return
-            self._fire_and_forget(self._send_to_peer(
-                dest_addr,
-                {"message": command.message, "source": self.node_id}
-            ))
+            payload = {"message": command.message, "source": self.node_id}
+            if self._comm_protocol == "zenoh":
+                self._zenoh_publish(f"gradys/msg/{command.destination}", payload)
+            else:
+                self._fire_and_forget(self._send_to_peer(dest_addr, payload))
 
         elif command.command_type == CommunicationCommandType.BROADCAST:
-            for nid, addr in self.node_ip_dict.items():
-                if nid != self.node_id:
-                    self._fire_and_forget(self._send_to_peer(
-                        addr,
-                        {"message": command.message, "source": self.node_id}
-                    ))
+            payload = {"message": command.message, "source": self.node_id}
+            if self._comm_protocol == "zenoh":
+                # One publish on the shared broadcast key — not an O(n) per-peer loop.
+                self._zenoh_publish("gradys/msg/broadcast", payload)
+            else:
+                for nid, addr in self.node_ip_dict.items():
+                    if nid != self.node_id:
+                        self._fire_and_forget(self._send_to_peer(addr, payload))
 
     def send_mobility_command(self, command: MobilityCommand) -> None:
         if command.command_type == MobilityCommandType.GOTO_COORDS:
@@ -175,8 +190,8 @@ class EmbeddedEncapsulator(IEncapsulator):
     Encapsulates the protocol to work with the embedded runner.
     """
 
-    def __init__(self, runner_configuration: RunnerConfiguration, loop: asyncio.AbstractEventLoop, session: aiohttp.ClientSession):
-        self.provider = EmbeddedProvider(runner_configuration, loop, self.handle_timer, session)
+    def __init__(self, runner_configuration: RunnerConfiguration, loop: asyncio.AbstractEventLoop, session: aiohttp.ClientSession, zenoh_session=None):
+        self.provider = EmbeddedProvider(runner_configuration, loop, self.handle_timer, session, zenoh_session=zenoh_session)
 
     def encapsulate(self, protocol: Type[IProtocol]) -> None:
         self.protocol = protocol.instantiate(self.provider)

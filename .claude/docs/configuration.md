@@ -9,16 +9,18 @@ Every knob in `RunnerConfiguration` and the invariants that must hold across the
 class RunnerConfiguration:
     node_id: int
     node_ip_dict: dict[int, str]
-    origin_gps_coordinates: tuple[float, float, float]
     initial_position: tuple[float, float, float]
     uav_api_port: int
+    control_api_port: int
+    origin_gps_coordinates: tuple[float, float, float] | None = None
     telemetry_interval: float = 0.5
     communication_protocol: str = "http"
+    auto_scout: bool = False
     certfile: str | None = None
     keyfile: str | None = None
 ```
 
-All fields except `telemetry_interval`, `communication_protocol`, `certfile`, and `keyfile` are required. There is no validation beyond type hints; the runner will fail at runtime (usually inside the `POST /protocol/setup` handler) if values are incoherent.
+All fields except `origin_gps_coordinates`, `x_axis_degrees`, `telemetry_interval`, `communication_protocol`, `auto_scout`, `certfile`, and `keyfile` are required. `communication_protocol` is validated against `{"http","https","http3","zenoh"}` in `__post_init__` (invalid values raise `ValueError`); everything else relies on type hints and the runner will fail at runtime (usually inside the `POST /protocol/setup` handler) if values are incoherent.
 
 ## Per-node fields
 
@@ -40,7 +42,7 @@ node_ip_dict = {
 }
 ```
 
-The runner extracts its own entry (`node_ip_dict[node_id]`), parses host/port with `rsplit(":", 1)`, and binds the FastAPI message server on `0.0.0.0:<port>`. For peer sends, it reads the full `ip:port` string and POSTs to `http://<ip:port>/message`.
+The runner extracts its own entry (`node_ip_dict[node_id]`), parses host/port with `rsplit(":", 1)`, and binds the **data plane** on `0.0.0.0:<port>` — the FastAPI `/message` server for http/https/http3, or the Zenoh transport for `"zenoh"`. For HTTP peer sends it reads the full `ip:port` and POSTs to `http://<ip:port>/message`; for zenoh under `auto_scout=False` the same `ip:port` entries become Zenoh `tcp/<ip:port>` connect endpoints. The control plane (`/protocol/*`) is **not** on this port — it is on `control_api_port`.
 
 Rules:
 
@@ -88,6 +90,10 @@ These can legitimately differ between nodes:
 
 The port of the local `uav_api` HTTP server. Typically `8000` on every drone, but nothing prevents per-drone overrides (e.g., if you also run a ground-station `uav_api` on a different port on the same host for testing).
 
+### `control_api_port: int`
+
+Dedicated HTTP port for the **control plane** (`POST /protocol/setup`, `POST /protocol/start`). This is the port an operator curls to bring the drone up. It is always plain HTTP, independent of `communication_protocol`. The **data plane** (`/message`, or the Zenoh transport) lives separately on this node's `node_ip_dict` port — the two never share a port. Must be unique per node when several nodes run on one host (the sitl-tester allocates `base_control_port + i`, default base `6000`).
+
 ### `telemetry_interval: float = 0.5`
 
 Seconds between GPS polls. Default 0.5 s is a reasonable balance between responsiveness and load. Lower it for fast-moving platforms or tight waypoint tolerance; raise it for slow traversals or weak links. Tuning notes in `→ .claude/docs/mobility-and-telemetry.md` which covers the telemetry loop and failure handling.
@@ -99,8 +105,16 @@ Selects the inter-node message-API transport. One of:
 - `"http"` (default) — HTTP/1.1 over TCP via uvicorn, plain (no TLS).
 - `"https"` — HTTP/1.1 over TLS via uvicorn, using `certfile`/`keyfile` (or an ephemeral self-signed cert).
 - `"http3"` — HTTP/3 over QUIC (UDP) via Hypercorn, TLS 1.3; requires the optional deps `pip install "gradys-embedded[http3]"`.
+- `"zenoh"` — Eclipse Zenoh pub/sub in **peer (p2p) mode**; requires `pip install "gradys-embedded[zenoh]"`. Messages are routed by key expression (`gradys/msg/<dest_id>`, `gradys/msg/broadcast`) rather than per-peer IP POSTs, so BROADCAST is a single publish. Discovery is governed by `auto_scout` (below). Full details: `→ .claude/docs/cross-node-communication.md`.
 
 Invalid values raise `ValueError` at construction. **This is a fleet-wide invariant** — every node must use the same value, like `origin_gps_coordinates`; mixed transports cannot interoperate. It does not affect the local `uav_api` connection, which always uses plain HTTP on `localhost`. Full transport comparison: `→ .claude/docs/cross-node-communication.md`.
+
+### `auto_scout: bool = False`
+
+Whether nodes discover each other automatically instead of via the static `node_ip_dict`. **Only implemented for `communication_protocol == "zenoh"`** — it is accepted but **ignored for `"http"`/`"https"`/`"http3"`** (those transports have no discovery; a warning is logged if set). When zenoh:
+
+- `False` (default) — Zenoh peer mode with multicast **disabled** and explicit `connect.endpoints` built from `node_ip_dict` (works on multicast-blocked LANs; keeps `node_ip_dict` authoritative). The node's Zenoh TCP transport binds the `node_ip_dict` port directly.
+- `True` — Zenoh peer mode using default **UDP multicast scouting** (`224.0.0.224:7446`); peers auto-discover and `node_ip_dict` is not needed for transport. Requires multicast on the LAN; on a single host the default interface may need to be specified.
 
 ### `certfile: str | None = None` / `keyfile: str | None = None`
 

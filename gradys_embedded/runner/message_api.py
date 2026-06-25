@@ -53,8 +53,23 @@ def _build_protocol_router(runner: "EmbeddedRunner") -> APIRouter:
     return router
 
 
-def create_app(runner: "EmbeddedRunner") -> FastAPI:
+def create_message_app(runner: "EmbeddedRunner") -> FastAPI:
+    """Data-plane app: the inter-node `/message` endpoint only.
+
+    Served on the node's message port (`node_ip_dict[node_id]`) by the selected
+    `communication_protocol` transport. Kept separate from the control plane so the
+    message port belongs entirely to the data plane (notably, so Zenoh's transport can
+    own that port without colliding with a uvicorn control server)."""
     app = FastAPI()
     app.include_router(_build_message_router(runner))
+    return app
+
+
+def create_control_app(runner: "EmbeddedRunner") -> FastAPI:
+    """Control-plane app: the `/protocol/setup` + `/protocol/start` endpoints only.
+
+    Served over plain HTTP on `control_api_port` for every transport, independently of
+    `communication_protocol`. This is the surface an operator drives to bring a drone up."""
+    app = FastAPI()
     app.include_router(_build_protocol_router(runner))
     return app

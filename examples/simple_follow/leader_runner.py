@@ -11,6 +11,7 @@ if __name__ == "__main__":
             1: "localhost:5001"
         },
         uav_api_port=8000,
+        control_api_port=6000,
         origin_gps_coordinates=None,  # Use current UAV position as origin
         x_axis_degrees=None,
         initial_position=(0, 0, 4)

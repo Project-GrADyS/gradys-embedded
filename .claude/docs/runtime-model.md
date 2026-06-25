@@ -11,12 +11,17 @@ runner.start_api()    # blocks; owns the asyncio loop
 
 `start_api()` is the only public method. It does **not** arm the drone or instantiate the protocol — those happen later, when an external client POSTs to the protocol router.
 
-After `start_api()` returns control to uvicorn, lifecycle is driven over HTTP:
+After `start_api()` returns control to uvicorn, lifecycle is driven over HTTP. The control plane
+and the data plane are **two independent servers** (see below):
 
 ```
-POST /protocol/setup   → arm + takeoff + go to initial_position
-POST /protocol/start   → instantiate protocol, initialize, begin telemetry polling
-POST /message          → inter-node delivery (always available; 409 if /protocol/start has not run yet)
+control plane  (control_api_port, always plain HTTP):
+  POST /protocol/setup   → arm + takeoff + go to initial_position
+  POST /protocol/start   → instantiate protocol, initialize, begin telemetry polling
+
+data plane     (node_ip_dict port, transport = communication_protocol):
+  POST /message          → inter-node delivery for http/https/http3 (409 until /protocol/start)
+  (zenoh)                → inter-node delivery via Zenoh pub/sub instead of POST /message
 ```
 
 ## `start_api()` — what it does
@@ -30,15 +35,22 @@ POST /message          → inter-node delivery (always available; 409 if /protoc
 `_serve_communication()` is the task that boots HTTP:
 
 1. Creates `self._session = aiohttp.ClientSession()` on the runner-owned loop. Every subsequent HTTP call (setup, telemetry, peer sends) reuses this session.
-2. Resolves the bind port from `node_ip_dict[node_id]` (`"host:port"` parsed with `rsplit(":", 1)`).
-3. Builds the FastAPI app via `create_app(self)` — see below.
-4. Dispatches on `communication_protocol` to one of `_serve_http` (plain uvicorn), `_serve_https` (uvicorn with `ssl_certfile`/`ssl_keyfile`), or `_serve_http3` (Hypercorn over QUIC). All three `await server.serve()` and run for the process lifetime.
+2. Resolves the data-plane bind port from `node_ip_dict[node_id]` (`"host:port"` parsed with `rsplit(":", 1)`).
+3. Builds **two** apps: `create_control_app(self)` (the `/protocol/*` router) and `create_message_app(self)` (the `/message` router).
+4. Runs **two servers concurrently** via `asyncio.gather`:
+   - **Control plane** — `_serve_control` runs the control app on `control_api_port` over plain HTTP (`_run_uvicorn`), for every transport.
+   - **Data plane** — dispatches on `communication_protocol` to `_serve_http` / `_serve_https` (uvicorn) or `_serve_http3` (Hypercorn) serving the message-only app on the `node_ip_dict` port, or `_serve_zenoh` which opens a Zenoh peer session (no uvicorn message server). All run for the process lifetime.
 
-Because `_serve_communication` creates the session **before** awaiting `serve()`, by the time the server binds and starts accepting requests the session is already attached to the runner. Endpoint handlers can rely on `runner._session` being non-None.
+To avoid two uvicorn servers racing to install process-wide signal handlers, `_run_uvicorn` disables per-server signal handling; the runner's own `KeyboardInterrupt` path owns shutdown.
 
-## The unified FastAPI app
+Because `_serve_communication` creates the session **before** starting the servers, by the time they bind the session is already attached to the runner. Endpoint handlers can rely on `runner._session` being non-None.
 
-`create_app(runner)` mounts two `APIRouter`s on a single `FastAPI` instance:
+## The two FastAPI apps (control plane vs data plane)
+
+The `/protocol/*` and `/message` routers used to share one app on one port. They are now split into
+two apps served on two ports, so the data-plane port belongs entirely to the transport (notably so
+Zenoh can own it). `message_api.create_control_app(runner)` and `create_message_app(runner)` each
+mount one `APIRouter`:
 
 ### Message router — `POST /message`
 
@@ -74,12 +86,17 @@ Returns True if all three succeed.
 
 ```python
 async def _bootstrap_protocol(self):
-    self._encapsulator = EmbeddedEncapsulator(config, self._loop, self._session)
+    self._encapsulator = EmbeddedEncapsulator(config, self._loop, self._session, zenoh_session=self._zenoh_session)
     self._encapsulator.encapsulate(self._protocol_class)  # instantiate protocol
     self._encapsulator.initialize()                        # call protocol.initialize()
 
     self._loop.create_task(self._periodic_telemetry())
 ```
+
+`self._zenoh_session` is `None` unless `communication_protocol == "zenoh"`, in which case
+`_serve_zenoh` (which runs from `start_api`, before `/protocol/start`) has already opened the shared
+peer session; the provider publishes on it. The Zenoh subscriber callback, like the `/message` 409
+guard, drops inbound samples while `self._encapsulator is None` (before start).
 
 The protocol's `initialize` runs **before** the telemetry loop is started. Note the difference from earlier versions of this runner: there is no longer a separate `_start_message_server` task because the message router is part of the same FastAPI app already running inside `_serve_api`. The `/message` endpoint has been listening since `start_api` started uvicorn — it just rejected with 409 until `_bootstrap_protocol` populated `self._encapsulator`.
 
@@ -126,8 +143,9 @@ The runner's `finally` block in `start_api()`:
 ## Threading / concurrency model summary
 
 - **One process per drone.**
-- **One asyncio loop** owned by `EmbeddedRunner`.
-- **No threads.** `uvicorn.Server` runs cooperatively on the same loop (`loop="asyncio"`).
+- **One asyncio loop** owned by `EmbeddedRunner`. Two servers (control + data plane) run cooperatively on it.
+- **No threads for HTTP.** `uvicorn.Server` runs cooperatively on the same loop (`loop="asyncio"`).
+- **Exception: Zenoh.** Its subscriber callback fires on a Zenoh-owned background thread; the callback only marshals onto the loop via `self._loop.call_soon_threadsafe(self._encapsulator.handle_packet, message)` — it must never touch protocol/loop state directly.
 - **Blocking inside any `handle_*` hook freezes everything** — including the `/protocol` and `/message` endpoints.
 
 ## Related docs
