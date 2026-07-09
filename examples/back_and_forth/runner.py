@@ -10,6 +10,7 @@ if __name__ == "__main__":
             0: "http://localhost:5000",
         },
         uav_api_port=8000,
+        control_api_port=6000,
         #origin_gps_coordinates=(-15.840081, -47.926642, -0.016),
         origin_gps_coordinates=None,  # Use current UAV position as origin
         initial_position=(0, 0, 2)

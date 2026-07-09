@@ -5,12 +5,13 @@ from typing import Type
 import aiohttp
 import uvicorn
 
+from gradys_embedded.communication import CommunicationBackend, create_backend
 from gradys_embedded.encapsulator.embedded import EmbeddedEncapsulator
 from gradys_embedded.protocol.interface import IProtocol
 from gradys_embedded.protocol.messages.telemetry import Telemetry
 from gradys_embedded.protocol.position import cartesian_to_geo, geo_to_cartesian
 from gradys_embedded.runner.configuration import RunnerConfiguration
-from gradys_embedded.runner.message_api import create_app
+from gradys_embedded.runner.control_panel import create_control_app
 
 
 class EmbeddedRunner:
@@ -23,6 +24,8 @@ class EmbeddedRunner:
         self._encapsulator: EmbeddedEncapsulator | None = None
         self._setup_done = False
         self._started = False
+        # Data-plane transport for the configured communication_protocol (built at boot).
+        self._backend: CommunicationBackend | None = None
 
     def start_api(self) -> None:
         logging.basicConfig(
@@ -33,7 +36,7 @@ class EmbeddedRunner:
         self._loop = asyncio.new_event_loop()
         asyncio.set_event_loop(self._loop)
 
-        self._loop.create_task(self._serve_api())
+        self._loop.create_task(self._serve_communication())
 
         try:
             self._loop.run_forever()
@@ -42,6 +45,8 @@ class EmbeddedRunner:
         finally:
             if self._encapsulator is not None:
                 self._encapsulator.finish()
+            if self._backend is not None:
+                self._loop.run_until_complete(self._backend.close())
             if self._session is not None:
                 self._loop.run_until_complete(self._session.close())
             self._loop.close()
@@ -66,43 +71,26 @@ class EmbeddedRunner:
             self._configuration.x_axis_degrees = float(info["heading"])
             self._logger.info(f"x_axis_degrees set to: {self._configuration.x_axis_degrees}")
 
-    async def _serve_api(self) -> None:
+    async def _serve_communication(self) -> None:
         self._session = aiohttp.ClientSession()
 
         await self._ensure_origin_and_heading()
 
-        own_addr = self._configuration.node_ip_dict[self._configuration.node_id]
-        _, port_str = own_addr.rsplit(":", 1)
-        port = int(port_str)
+        # Control plane (/protocol/*) and the data plane run as two independent servers. The
+        # control plane is plain HTTP on control_api_port for every transport; the data plane
+        # owns the node_ip_dict port via the selected communication_protocol's backend.
+        control_app = create_control_app(self)
+        self._backend = create_backend(self)
 
-        app = create_app(self)
-        if self._configuration.udp:
-            await self._serve_udp(app, port)
-        else:
-            config = uvicorn.Config(app, host="0.0.0.0", port=port, loop="asyncio")
-            server = uvicorn.Server(config)
-            await server.serve()
+        await asyncio.gather(self._serve_control(control_app), self._backend.serve())
 
-    async def _serve_udp(self, app, port: int) -> None:
-        from hypercorn.config import Config
-        from hypercorn.asyncio import serve
-
-        from gradys_embedded.runner.certs import generate_self_signed_cert
-
-        certfile = self._configuration.certfile
-        keyfile = self._configuration.keyfile
-        if certfile is None or keyfile is None:
-            certfile, keyfile = generate_self_signed_cert()
-            self._logger.info("No TLS cert provided; using an ephemeral self-signed certificate for the QUIC server")
-
-        config = Config()
-        config.bind = [f"0.0.0.0:{port}"]
-        config.quic_bind = [f"0.0.0.0:{port}"]
-        config.certfile = certfile
-        config.keyfile = keyfile
-
-        # The runner's event loop owns the lifecycle; never let Hypercorn self-shutdown.
-        await serve(app, config, shutdown_trigger=lambda: asyncio.Future())
+    async def _serve_control(self, app) -> None:
+        config = uvicorn.Config(app, host="0.0.0.0", port=self._configuration.control_api_port, loop="asyncio")
+        server = uvicorn.Server(config)
+        # Several servers share this loop; let the runner's own KeyboardInterrupt handling own
+        # shutdown instead of each server racing to install process-wide signal handlers.
+        server.install_signal_handlers = lambda: None
+        await server.serve()
 
     async def _goto_initial_position(self) -> bool:
         arm_result = await self._session.get(f"http://localhost:{self._configuration.uav_api_port}/command/arm")
@@ -124,7 +112,7 @@ class EmbeddedRunner:
         return True
 
     async def _bootstrap_protocol(self) -> None:
-        self._encapsulator = EmbeddedEncapsulator(self._configuration, self._loop, self._session)
+        self._encapsulator = EmbeddedEncapsulator(self._configuration, self._loop, self._session, backend=self._backend)
         self._encapsulator.encapsulate(self._protocol_class)
         self._encapsulator.initialize()
 

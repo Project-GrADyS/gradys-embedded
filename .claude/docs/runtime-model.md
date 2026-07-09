@@ -1,6 +1,6 @@
 # Runtime Model
 
-How `EmbeddedRunner` boots, runs, and shuts down. Source: `gradys_embedded/runner/runner.py`, `gradys_embedded/runner/message_api.py`.
+How `EmbeddedRunner` boots, runs, and shuts down. Source: `gradys_embedded/runner/runner.py`, `gradys_embedded/runner/control_panel.py`.
 
 ## The single public entry point
 
@@ -11,12 +11,17 @@ runner.start_api()    # blocks; owns the asyncio loop
 
 `start_api()` is the only public method. It does **not** arm the drone or instantiate the protocol — those happen later, when an external client POSTs to the protocol router.
 
-After `start_api()` returns control to uvicorn, lifecycle is driven over HTTP:
+After `start_api()` returns control to uvicorn, lifecycle is driven over HTTP. The control plane
+and the data plane are **two independent servers** (see below):
 
 ```
-POST /protocol/setup   → arm + takeoff + go to initial_position
-POST /protocol/start   → instantiate protocol, initialize, begin telemetry polling
-POST /message          → inter-node delivery (always available; 409 if /protocol/start has not run yet)
+control plane  (control_api_port, always plain HTTP):
+  POST /protocol/setup   → arm + takeoff + go to initial_position
+  POST /protocol/start   → instantiate protocol, initialize, begin telemetry polling
+
+data plane     (node_ip_dict port, transport = communication_protocol):
+  POST /message          → inter-node delivery for http/https/http3 (409 until /protocol/start)
+  (zenoh)                → inter-node delivery via Zenoh pub/sub instead of POST /message
 ```
 
 ## `start_api()` — what it does
@@ -27,20 +32,29 @@ POST /message          → inter-node delivery (always available; 409 if /protoc
 4. `self._loop.run_forever()` — blocks until `KeyboardInterrupt`.
 5. `finally`: `encapsulator.finish()` if the protocol was started; close the aiohttp session; close the loop.
 
-`_serve_api()` is the task that boots HTTP:
+`_serve_communication()` is the task that boots HTTP:
 
 1. Creates `self._session = aiohttp.ClientSession()` on the runner-owned loop. Every subsequent HTTP call (setup, telemetry, peer sends) reuses this session.
-2. Resolves the bind port from `node_ip_dict[node_id]` (`"host:port"` parsed with `rsplit(":", 1)`).
-3. Builds the FastAPI app via `create_app(self)` — see below.
-4. `await uvicorn.Server(uvicorn.Config(app, host="0.0.0.0", port=port, loop="asyncio")).serve()`.
+2. Builds the control app (`create_control_app(self)`, the `/protocol/*` router) and the data-plane backend (`create_backend(self)` from `gradys_embedded.communication`, selected by `communication_protocol`).
+3. Runs **two servers concurrently** via `asyncio.gather`:
+   - **Control plane** — `_serve_control` runs the control app on `control_api_port` over plain HTTP, for every transport.
+   - **Data plane** — `self._backend.serve()`. The `HttpBackend` (http/https/http3) serves its `/message` app on the `node_ip_dict` port via uvicorn/Hypercorn; the `ZenohBackend` (zenoh_tcp/zenoh_quic) opens a Zenoh peer session instead (no uvicorn message server). Both run for the process lifetime. The backend resolves its own bind port from `node_ip_dict[node_id]`.
 
-Because `_serve_api` creates the session **before** awaiting `serve()`, by the time uvicorn binds and starts accepting requests the session is already attached to the runner. Endpoint handlers can rely on `runner._session` being non-None.
+To avoid two uvicorn servers racing to install process-wide signal handlers, both the control server and the HTTP backend disable per-server signal handling; the runner's own `KeyboardInterrupt` path owns shutdown (and calls `self._backend.close()`).
 
-## The unified FastAPI app
+Because `_serve_communication` creates the session **before** starting the servers, by the time they bind the session is already attached to the runner. Endpoint handlers can rely on `runner._session` being non-None.
 
-`create_app(runner)` mounts two `APIRouter`s on a single `FastAPI` instance:
+## The control app and the data-plane backend
 
-### Message router — `POST /message`
+The `/protocol/*` and `/message` routers used to share one app on one port. The control plane is now
+its own app on `control_api_port` (`control_panel.create_control_app(runner)`), and the data plane is
+owned by a `CommunicationBackend` (`gradys_embedded/communication/`) — for the HTTP transports the
+backend serves the `/message` app (`communication.http.build_message_app(runner)`) on the
+`node_ip_dict` port; for the zenoh transports there is no `/message` app at all. The control router:
+
+### Message app — `POST /message` (HTTP transports only)
+
+Built by `communication.http.build_message_app(runner)` and served by the `HttpBackend`:
 
 ```python
 @router.post("/message")
@@ -51,7 +65,7 @@ async def receive_message(payload: MessagePayload):
     return {"status": "ok"}
 ```
 
-The 409 guard prevents `AttributeError` if a peer sends a message before this node has finished `/protocol/start`. Wire format and full message semantics: `→ .claude/docs/cross-node-communication.md`.
+The 409 guard prevents `AttributeError` if a peer sends a message before this node has finished `/protocol/start`. The zenoh backends have no `/message` app — their subscriber callback applies the same drop-before-start guard. Wire format and full message semantics: `→ .claude/docs/cross-node-communication.md`.
 
 ### Protocol router — `POST /protocol/setup`, `POST /protocol/start`
 
@@ -74,14 +88,16 @@ Returns True if all three succeed.
 
 ```python
 async def _bootstrap_protocol(self):
-    self._encapsulator = EmbeddedEncapsulator(config, self._loop, self._session)
+    self._encapsulator = EmbeddedEncapsulator(config, self._loop, self._session, backend=self._backend)
     self._encapsulator.encapsulate(self._protocol_class)  # instantiate protocol
     self._encapsulator.initialize()                        # call protocol.initialize()
 
     self._loop.create_task(self._periodic_telemetry())
 ```
 
-The protocol's `initialize` runs **before** the telemetry loop is started. Note the difference from earlier versions of this runner: there is no longer a separate `_start_message_server` task because the message router is part of the same FastAPI app already running inside `_serve_api`. The `/message` endpoint has been listening since `start_api` started uvicorn — it just rejected with 409 until `_bootstrap_protocol` populated `self._encapsulator`.
+The encapsulator receives `self._backend` (the `CommunicationBackend` built in `_serve_communication`), and the provider delegates SEND/BROADCAST to it. For the zenoh transports, `backend.serve()` (which runs from `start_api`, before `/protocol/start`) has already opened the shared peer session that `backend.send`/`broadcast` publish on; its subscriber callback, like the `/message` 409 guard, drops inbound samples while `self._encapsulator is None` (before start).
+
+The protocol's `initialize` runs **before** the telemetry loop is started. The data plane has been bound since `start_api` started the backend — the `/message` endpoint (HTTP transports) just rejected with 409, and the zenoh subscriber just dropped samples, until `_bootstrap_protocol` populated `self._encapsulator`.
 
 Practical consequence: messages broadcast from `initialize` will reach peers whose own `/protocol/start` has already run, but will be rejected by peers still in the setup phase. Boot ordering across drones is uncoordinated — design protocols to tolerate dropped bootstrap broadcasts, or delay the first broadcast with a short timer.
 
@@ -126,8 +142,9 @@ The runner's `finally` block in `start_api()`:
 ## Threading / concurrency model summary
 
 - **One process per drone.**
-- **One asyncio loop** owned by `EmbeddedRunner`.
-- **No threads.** `uvicorn.Server` runs cooperatively on the same loop (`loop="asyncio"`).
+- **One asyncio loop** owned by `EmbeddedRunner`. Two servers (control + data plane) run cooperatively on it.
+- **No threads for HTTP.** `uvicorn.Server` runs cooperatively on the same loop (`loop="asyncio"`).
+- **Exception: Zenoh.** Its subscriber callback fires on a Zenoh-owned background thread; the callback only marshals onto the loop via `self._loop.call_soon_threadsafe(self._encapsulator.handle_packet, message)` — it must never touch protocol/loop state directly.
 - **Blocking inside any `handle_*` hook freezes everything** — including the `/protocol` and `/message` endpoints.
 
 ## Related docs

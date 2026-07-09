@@ -1,30 +1,18 @@
+"""Control-panel HTTP app (`/protocol/*`).
+
+The inter-node data-plane `/message` endpoint lives with the HTTP transport in
+`gradys_embedded/communication/http.py`; this module owns only the control panel, which is always
+served over plain HTTP on `control_api_port` regardless of `communication_protocol`.
+"""
+
 from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
 from fastapi import APIRouter, FastAPI, HTTPException
-from pydantic import BaseModel
 
 if TYPE_CHECKING:
     from gradys_embedded.runner.runner import EmbeddedRunner
-
-
-class MessagePayload(BaseModel):
-    message: str
-    source: int
-
-
-def _build_message_router(runner: "EmbeddedRunner") -> APIRouter:
-    router = APIRouter()
-
-    @router.post("/message")
-    async def receive_message(payload: MessagePayload):
-        if runner._encapsulator is None:
-            raise HTTPException(status_code=409, detail="Protocol not started")
-        runner._encapsulator.handle_packet(payload.message)
-        return {"status": "ok"}
-
-    return router
 
 
 def _build_protocol_router(runner: "EmbeddedRunner") -> APIRouter:
@@ -53,8 +41,11 @@ def _build_protocol_router(runner: "EmbeddedRunner") -> APIRouter:
     return router
 
 
-def create_app(runner: "EmbeddedRunner") -> FastAPI:
+def create_control_app(runner: "EmbeddedRunner") -> FastAPI:
+    """Control-panel app: the `/protocol/setup` + `/protocol/start` endpoints only.
+
+    Served over plain HTTP on `control_api_port` for every transport, independently of
+    `communication_protocol`. This is the surface an operator drives to bring a drone up."""
     app = FastAPI()
-    app.include_router(_build_message_router(runner))
     app.include_router(_build_protocol_router(runner))
     return app
