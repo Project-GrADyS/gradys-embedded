@@ -18,6 +18,22 @@ def test_boots_idle(runner):
     assert status["protocol"] is None
 
 
+def test_control_surface_has_no_legacy_endpoints(runner):
+    """The mission API is the only gateway; /protocol/* is gone, not aliased."""
+    from gradys_embedded.runner.control_panel import create_control_app
+
+    paths = create_control_app(runner).openapi()["paths"]
+
+    assert "/protocol/setup" not in paths
+    assert "/protocol/start" not in paths
+    for path in ["/mission/load", "/mission/setup", "/mission/start",
+                 "/mission/stop", "/mission/status",
+                 "/protocols", "/protocols/upload",
+                 "/runs", "/runs/{run_id}", "/runs/{run_id}/archive",
+                 "/runs/{run_id}/files/{filename}"]:
+        assert path in paths, path
+
+
 def test_setup_and_start_require_a_loaded_mission(runner, loop):
     with pytest.raises(MissionError) as excinfo:
         loop.run_until_complete(runner.mission.setup())

@@ -1,7 +1,7 @@
 import asyncio
 import logging
 from dataclasses import replace
-from typing import Optional, Type
+from typing import Type
 
 import aiohttp
 import uvicorn
@@ -28,14 +28,13 @@ class EmbeddedRunner:
     poll. Anything belonging to a single mission lives on :class:`MissionManager`,
     so a protocol can be swapped without restarting any of the above.
 
-    `protocol` is accepted for backwards compatibility but is NOT started
-    automatically: the service boots idle and runs a protocol only when told to
-    over HTTP. A rebooting drone in the field must never spontaneously arm.
+    The service boots idle and runs a protocol only when a mission is loaded
+    over HTTP -- every `/mission/load` names its protocol. A rebooting drone in
+    the field must never spontaneously arm.
     """
 
-    def __init__(self, configuration: RunnerConfiguration, protocol: Optional[Type[IProtocol]] = None):
+    def __init__(self, configuration: RunnerConfiguration):
         self._configuration = configuration
-        self._default_protocol_class = protocol
         self._logger = logging.getLogger(__name__)
         self._loop: asyncio.AbstractEventLoop | None = None
         self._session: aiohttp.ClientSession | None = None

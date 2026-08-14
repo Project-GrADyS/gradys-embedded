@@ -21,10 +21,15 @@ from gradys_embedded.runner.configuration import RunnerConfiguration
 # Declared as tuples on the dataclass; TOML can only express arrays.
 _TUPLE_FIELDS = {"initial_position", "origin_gps_coordinates"}
 
-# Not a RunnerConfiguration field. It names a default protocol for operators to
-# load; it is NOT an autostart -- the service boots idle and only runs a protocol
-# when told to over HTTP.
-_PROTOCOL_KEY = "protocol"
+# Keys the loader once accepted, with a pointed error instead of the generic
+# unknown-key one: the message is the migration path for configs written
+# against the old surface.
+_REMOVED_KEYS = {
+    "protocol": (
+        "the default-protocol concept was removed; every POST /mission/load "
+        "names its protocol"
+    ),
+}
 
 
 class ConfigurationError(ValueError):
@@ -66,25 +71,22 @@ def _coerce_node_ip_dict(raw: Any) -> dict[int, str]:
     return coerced
 
 
-def parse_configuration(data: dict[str, Any]) -> tuple[RunnerConfiguration, str | None]:
-    """Build a runner configuration from an already-parsed TOML mapping.
-
-    Returns the configuration and the protocol import path, if one was given.
-    """
+def parse_configuration(data: dict[str, Any]) -> RunnerConfiguration:
+    """Build a runner configuration from an already-parsed TOML mapping."""
     data = dict(data)
-    protocol_path = data.pop(_PROTOCOL_KEY, None)
-    if protocol_path is not None and not isinstance(protocol_path, str):
-        raise ConfigurationError(
-            f"{_PROTOCOL_KEY} must be a string like \"my_module:MyProtocol\""
-        )
 
     known = {f.name: f for f in fields(RunnerConfiguration)}
+
+    removed = sorted(set(data) & set(_REMOVED_KEYS))
+    if removed:
+        reasons = "; ".join(f"{key}: {_REMOVED_KEYS[key]}" for key in removed)
+        raise ConfigurationError(f"Removed configuration key(s): {reasons}")
 
     unknown = sorted(set(data) - set(known))
     if unknown:
         raise ConfigurationError(
             f"Unknown configuration key(s): {', '.join(unknown)}. "
-            f"Valid keys are: {', '.join(sorted(known))}, {_PROTOCOL_KEY}"
+            f"Valid keys are: {', '.join(sorted(known))}"
         )
 
     missing = sorted(
@@ -111,10 +113,10 @@ def parse_configuration(data: dict[str, Any]) -> tuple[RunnerConfiguration, str 
     except (TypeError, ValueError) as exc:
         raise ConfigurationError(str(exc)) from exc
 
-    return configuration, protocol_path
+    return configuration
 
 
-def load_configuration(path: str | Path) -> tuple[RunnerConfiguration, str | None]:
+def load_configuration(path: str | Path) -> RunnerConfiguration:
     """Read a TOML file and build a runner configuration from it."""
     path = Path(path).expanduser()
 

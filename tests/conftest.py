@@ -39,7 +39,6 @@ class StubRunner:
         self._session = None
         self._backend = None
         self._encapsulator = None
-        self._default_protocol_class = None
         self.commands = []
         self.setup_succeeds = True
         self.mission = None

@@ -22,16 +22,8 @@ initial_position = [0.0, 0.0, 10.0]
 # uav_api is always reached over plain HTTP on localhost at this port.
 uav_api_port = 8000
 
-# Control plane: POST /protocol/setup and /protocol/start land here.
+# Control plane: the /mission, /protocols and /runs endpoints land here.
 control_api_port = 6000
-
-# --- Protocol ----------------------------------------------------------------
-
-# A DEFAULT SUGGESTION, not an autostart. The service boots idle and flies
-# nothing until a mission is loaded over HTTP (POST /mission/load), so a drone
-# that reboots in the field never spontaneously arms. Naming a protocol here only
-# tells the legacy /protocol/setup endpoint which one to use.
-protocol = "protocol:MyProtocol"
 
 # --- Run data ----------------------------------------------------------------
 

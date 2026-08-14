@@ -7,9 +7,6 @@ Three routers, all served over plain HTTP on `control_api_port` regardless of
   /mission    load, set up, start and stop the current mission
   /runs       list and download the data each run produced
 
-`/protocol/setup` and `/protocol/start` are kept as aliases of the mission
-lifecycle so existing operators, runbooks and gradys-sitl-tester keep working.
-
 The inter-node data-plane `/message` endpoint lives with the HTTP transport in
 `gradys_embedded/communication/http.py`; this module owns only the control panel.
 """
@@ -24,7 +21,7 @@ from fastapi import APIRouter, FastAPI, File, HTTPException, UploadFile
 from fastapi.responses import FileResponse, StreamingResponse
 from pydantic import BaseModel
 
-from gradys_embedded.runner.mission import MissionError, MissionState
+from gradys_embedded.runner.mission import MissionError
 
 if TYPE_CHECKING:
     from gradys_embedded.runner.runner import EmbeddedRunner
@@ -194,49 +191,6 @@ def _build_runs_router(runner: "EmbeddedRunner") -> APIRouter:
     return router
 
 
-def _build_legacy_protocol_router(runner: "EmbeddedRunner") -> APIRouter:
-    """The original `/protocol/setup` + `/protocol/start` pair.
-
-    Preserved so existing operators, experiment runbooks and gradys-sitl-tester
-    keep working unchanged. When the runner was constructed with a protocol class
-    and no mission has been loaded over HTTP, setup loads that protocol first --
-    which reproduces the old "construct with a protocol, POST setup, POST start"
-    flow exactly, without reintroducing autostart at boot.
-    """
-    router = APIRouter(prefix="/protocol", tags=["protocol (legacy)"])
-
-    @router.post("/setup", summary="Deprecated: use /mission/load then /mission/setup")
-    async def setup():
-        mission = _mission(runner)
-        try:
-            if mission.state is MissionState.IDLE:
-                if runner._default_protocol_class is None:
-                    raise MissionError(
-                        "No protocol loaded. Use POST /mission/load, or construct "
-                        "EmbeddedRunner with a protocol class.",
-                        status_code=409,
-                    )
-                cls = runner._default_protocol_class
-                await mission.load(
-                    protocol=f"{cls.__module__}:{cls.__name__}",
-                    protocol_class=cls,
-                )
-            await mission.setup()
-        except MissionError as exc:
-            raise _handle(exc)
-        return {"status": "ok"}
-
-    @router.post("/start", summary="Deprecated: use /mission/start")
-    async def start():
-        try:
-            await _mission(runner).start()
-        except MissionError as exc:
-            raise _handle(exc)
-        return {"status": "ok"}
-
-    return router
-
-
 def create_control_app(runner: "EmbeddedRunner") -> FastAPI:
     """Control-panel app.
 
@@ -250,5 +204,4 @@ def create_control_app(runner: "EmbeddedRunner") -> FastAPI:
     app.include_router(_build_protocols_router(runner))
     app.include_router(_build_mission_router(runner))
     app.include_router(_build_runs_router(runner))
-    app.include_router(_build_legacy_protocol_router(runner))
     return app

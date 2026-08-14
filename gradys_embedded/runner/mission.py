@@ -310,7 +310,6 @@ class MissionManager:
         return self._mission_config
 
     async def load(self, protocol: str, initial_position=None, label: Optional[str] = None,
-                   protocol_class: Optional[Type[IProtocol]] = None,
                    origin_gps_coordinates=None, x_axis_degrees=None, node_ip_dict=None,
                    communication_protocol=None, auto_scout=None) -> dict:
         """Open a run and select the protocol to fly.
@@ -323,10 +322,6 @@ class MissionManager:
         Loading also binds the data plane for the chosen transport — only the
         chosen one is ever served — reusing the running listener when the
         transport is unchanged.
-
-        `protocol_class` bypasses import resolution for callers that already hold
-        the class -- notably the legacy `/protocol/setup` path, whose protocol may
-        live in `__main__` and therefore not be importable by name.
         """
         if self.state is not MissionState.IDLE:
             raise MissionError(
@@ -340,8 +335,7 @@ class MissionManager:
 
         self._check_disk_space()
 
-        if protocol_class is None:
-            protocol_class = self.resolve_protocol(protocol)
+        protocol_class = self.resolve_protocol(protocol)
 
         run_id = "run_" + datetime.now().strftime("%Y%m%d_%H%M%S")
         if label:
