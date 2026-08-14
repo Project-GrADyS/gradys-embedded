@@ -21,9 +21,7 @@ calls the vehicle down when relative altitude drops below
 
 from __future__ import annotations
 
-import asyncio
 import importlib
-import importlib.util
 import json
 import logging
 import shutil
@@ -36,7 +34,6 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any, Optional, Type
 
 from gradys_embedded.communication import PROTOCOLS, missing_extra
-from gradys_embedded.encapsulator.embedded import EmbeddedEncapsulator
 from gradys_embedded.protocol.interface import IProtocol
 
 if TYPE_CHECKING:
@@ -91,7 +88,6 @@ class MissionManager:
         self._monitor = None
         self._log_handler: Optional[logging.Handler] = None
         self._started_at: Optional[float] = None
-        self._upload_counter = 0
 
         self.runs_dir = Path(self._configuration.runs_dir)
         self.protocols_dir = Path(self._configuration.protocols_dir)

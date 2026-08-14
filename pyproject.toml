@@ -31,6 +31,9 @@ dependencies = [
     'uvicorn>=0.32.0',
     'aiohttp>=3.9.0',
     'pydantic>=2.12.5',
+    # FastAPI needs it for the multipart form on POST /protocols/upload; without
+    # it the control app fails to build at import time in a clean environment.
+    'python-multipart>=0.0.9',
     'cryptography>=41.0.0',
     # Imported by protocol/plugin/statistics.py, which every experiment
     # protocol pulls in via create_statistics.
@@ -54,3 +57,9 @@ test = [
 
 [project.urls]
 "Homepage" = "https://github.com/Project-GrADyS/gradys-embedded"
+
+[tool.pytest.ini_options]
+# The repo root on sys.path is what makes `from tests.conftest import ...`
+# resolve under plain `pytest` (no tests/__init__.py; rootdir-relative).
+pythonpath = ["."]
+testpaths = ["tests"]
