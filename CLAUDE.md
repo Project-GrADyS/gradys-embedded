@@ -30,25 +30,41 @@ config = RunnerConfiguration(
     initial_position=(0, 0, 20),
 )
 
-runner = EmbeddedRunner(config, SimpleUAVProtocol)
+runner = EmbeddedRunner(config)
 runner.start_api()    # owns the loop; serves control plane + data plane as two servers
 ```
 
-`start_api()` is the only public method. The runner does **not** arm, take off, or instantiate the protocol on its own — those are driven by HTTP calls into the `/protocol` **control plane**, which runs on `control_api_port` (separate from the data-plane message port):
+Usually run as a service instead: `gradys-embedded --config /etc/gradys/embedded.toml`.
 
-```bash
-curl -X POST http://<drone>:<control_api_port>/protocol/setup   # arm + takeoff + go to initial_position
-curl -X POST http://<drone>:<control_api_port>/protocol/start   # initialize protocol + begin telemetry polling
+**This is a long-running mission service.** It boots IDLE and flies nothing until
+a mission is loaded over HTTP, so a protocol can be swapped without restarting
+the process — and a drone that reboots in the field never spontaneously arms.
+A protocol named in the config is a default suggestion, never an autostart.
+
+```
+IDLE ──load──▶ LOADED ──setup──▶ READY ──start──▶ RUNNING ──stop──▶ RETURNING ──▶ IDLE
 ```
 
-Each drone runs its own `EmbeddedRunner` with a unique `node_id`; `uav_api` must be running locally on `uav_api_port` on that drone before `/protocol/setup` is called. The control plane (`/protocol/*`) is served on `control_api_port`; the inter-node data plane (`/message`, or Zenoh) is served separately on the drone's `node_ip_dict` port.
+```bash
+BASE=http://<drone>:<control_api_port>
+curl -F file=@my_protocol.py $BASE/protocols/upload
+curl -X POST $BASE/mission/load -H 'Content-Type: application/json' -d '{"protocol":"my_protocol"}'
+curl -X POST $BASE/mission/setup     # arm + takeoff + go to initial_position
+curl -X POST $BASE/mission/start
+curl $BASE/mission/status            # state + live tracked_variables
+curl -X POST $BASE/mission/stop      # flush run data, then RTL
+curl $BASE/runs/<run_id>/archive -o run.tar.gz
+```
+
+Each drone runs its own `EmbeddedRunner` with a unique `node_id`; `uav_api` must be running locally on `uav_api_port` on that drone before `/mission/setup` is called. The control plane (`/mission`, `/protocols`, `/runs`, plus legacy `/protocol/*`) is served on `control_api_port`; the inter-node data plane (`/message`, or Zenoh) is served separately on the drone's `node_ip_dict` port.
 
 ## Hardware gotchas
 
 These are the things that bite you on real flights and don't show up in simulation.
 
 1. **Every node must share the same `origin_gps_coordinates`.** Positions in protocol code are cartesian (NEU: x=North, y=East, z=Up, meters). If two nodes use different origins, their cartesian frames disagree and messages like "go to (50, 0, 20)" mean different places. No code check enforces this — it is an operational invariant.
-2. **`uav_api` must be reachable at `http://localhost:<uav_api_port>` before `POST /protocol/setup` is called.** That handler runs `arm → takeoff → go_to_gps_wait(initial_position)`; any failure returns HTTP 500 and `/protocol/start` will refuse with 409 until setup succeeds. Note `/protocol/setup` and `/protocol/start` are served on `control_api_port`, **not** the data-plane message port.
+2. **`uav_api` must be reachable at `http://localhost:<uav_api_port>` before `POST /mission/setup` is called.** That handler runs `arm → takeoff → go_to_gps_wait(initial_position)`; any failure returns HTTP 500 (retryable — the mission stays LOADED) and `/mission/start` refuses with 409 until setup succeeds. The control plane is served on `control_api_port`, **not** the data-plane message port.
+2b. **`/mission/stop` returns immediately, before the drone has landed.** `uav_api`'s `/command/rtl` blocks until the vehicle is home *and* disarmed (~250 s), so stop issues it fire-and-forget after finishing the protocol and flushing its data. Status reports `returning` until telemetry shows the vehicle below `telemetry_landed_alt` — there is no flight-mode or armed-state endpoint to ask. A stopped protocol is gated off from commanding the vehicle, so it cannot fight the return.
 3. **Outbound communication is fire-and-forget.** `SendMessageCommand` / `BroadcastMessageCommand` schedule an `aiohttp.post` as an asyncio task; failures are logged but the protocol is never told a peer was unreachable. Design protocols assuming unreliable delivery.
 4. **`handle_telemetry` is polled, not pushed.** Default poll interval is `telemetry_interval=0.5` s. A protocol that relies on sub-second position reaction (tight waypoint tolerance, fast-moving objects) needs a lower interval and a UAV API that can keep up.
 5. **Asyncio-only.** The provider schedules timers with `loop.call_at`, and all HTTP traffic runs on a single `asyncio.new_event_loop()`. Blocking calls inside protocol hooks freeze the message server and telemetry loop. Keep `handle_*` methods non-blocking.
@@ -59,12 +75,15 @@ These are the things that bite you on real flights and don't show up in simulati
 
 ## Key concepts
 
-- **`EmbeddedRunner`** (`gradys_embedded/runner/runner.py`) — entry point; sole public method `start_api()` owns the asyncio loop and serves **two** servers: the control plane (`/protocol/*`) on `control_api_port` and the data plane (`/message`, or Zenoh) on the `node_ip_dict` port. Setup (arm/takeoff) and start (encapsulator + telemetry) are triggered by `POST /protocol/setup` and `POST /protocol/start` on the control port.
-- **`EmbeddedEncapsulator`** (`gradys_embedded/encapsulator/embedded.py`) — wraps a protocol and delegates the five `IProtocol` hooks.
+- **`EmbeddedRunner`** (`gradys_embedded/runner/runner.py`) — entry point; `start_api()` owns the asyncio loop and serves **two** servers: the control plane on `control_api_port` and the data plane (`/message`, or Zenoh) on the `node_ip_dict` port. Owns only process-scoped state: loop, shared `aiohttp` session, transport backend, and the process-lifetime telemetry poll.
+- **`MissionManager`** (`gradys_embedded/runner/mission.py`) — owns everything per-mission: the state machine, the run directory, protocol resolution/upload, the resource monitor, and RTL on stop. **The swap seam:** both transports read `runner._encapsulator` per delivery, so rebinding it re-routes inbound messages atomically without rebinding a port; setting it to `None` gives 409/drop back-pressure for free.
+- **`EmbeddedEncapsulator`** (`gradys_embedded/encapsulator/embedded.py`) — wraps a protocol and delegates the five `IProtocol` hooks. `finish()` runs `protocol.finish()` (where data is flushed) then `provider.shutdown()`, which cancels every timer and gates the provider off. Idempotent.
 - **`EmbeddedProvider`** (same file) — the `IProvider` implementation that turns abstract commands into HTTP against `uav_api` and peer nodes, plus `loop.call_at` timers.
-- **`RunnerConfiguration`** (`gradys_embedded/runner/configuration.py`) — `node_id`, `node_ip_dict`, `initial_position`, `uav_api_port`, `control_api_port`, `origin_gps_coordinates`, `telemetry_interval`, `communication_protocol`, `auto_scout` (+ optional `certfile`/`keyfile`).
+- **`RunnerConfiguration`** (`gradys_embedded/runner/configuration.py`) — `node_id`, `node_ip_dict`, `initial_position`, `uav_api_port`, `control_api_port`, `origin_gps_coordinates`, `telemetry_interval`, `communication_protocol`, `auto_scout` (+ optional `certfile`/`keyfile`), plus service settings `runs_dir`, `protocols_dir`, `min_free_disk_mb`, `telemetry_landed_alt`.
+- **Config loader / CLI** (`runner/config_file.py`, `runner/cli.py`) — `gradys-embedded --config <toml>`. The loader is deliberately strict: unknown or malformed keys raise rather than warn, because a fleet's config is generated and the failure modes it prevents are invisible until after a flight. It also rejects a scheme inside a `node_ip_dict` value.
 - **Communication backends** (`gradys_embedded/communication/`) — one `CommunicationBackend` per transport, owning both the data-plane *serve* (receive) and *send*/*broadcast* sides. `http.py` = `http`/`https`/`http3` (shared `/message` FastAPI app + peer-`POST`); `zenoh.py` = `zenoh_tcp`/`zenoh_quic` (Zenoh peer pub/sub); `certs.py` = TLS material; `__init__.create_backend(runner)` is the factory. The runner runs `backend.serve()`; the provider calls `backend.send`/`broadcast`.
-- **Control API** (`gradys_embedded/runner/control_panel.py`) — `create_control_app` only: the `/protocol/*` control plane, always plain HTTP on `control_api_port`. (The `/message` data-plane app moved into `communication/http.py`.) When `communication_protocol` is a zenoh transport there is no `/message` server — a Zenoh peer session carries messages instead.
+- **Control API** (`gradys_embedded/runner/control_panel.py`) — `create_control_app`: `/protocols` (upload/list/delete), `/mission` (load/setup/start/stop/status), `/runs` (list/manifest/file/archive/delete), plus legacy `/protocol/setup` and `/protocol/start` aliases kept so gradys-sitl-tester and existing runbooks keep working. Always plain HTTP on `control_api_port`. (The `/message` data-plane app lives in `communication/http.py`.) When `communication_protocol` is a zenoh transport there is no `/message` server — a Zenoh peer session carries messages instead.
+- **Run data** — one directory per mission under `runs_dir`: statistics CSVs, `resource_usage.csv`, `runner.log`, `RUN_INFO.json` (protocol, frame, outcome). Written periodically as well as at stop, so an unclean kill costs seconds of samples rather than the whole flight. Nothing is auto-pruned; below `min_free_disk_mb` a new run is refused with 507.
 
 ## Directories
 
@@ -88,5 +107,5 @@ These are the things that bite you on real flights and don't show up in simulati
 
 ## Cross-project pointers
 
-- `→ /home/fleury/gradys/major_projects/gradys-sim-nextgen/CLAUDE.md` — the simulator. The same `IProtocol` subclass runs there; the authoritative interface spec is `.claude/docs/protocol-lifecycle.md` in that project.
-- `→ /home/fleury/gradys/major_projects/uav_api/.claude/docs/specification.md` — **authoritative** HTTP contract for every endpoint this project hits on `localhost:uav_api_port`. Update it first if you add or change a command.
+- `→ https://github.com/Project-GrADyS/gradys-sim-nextgen/CLAUDE.md` — the simulator. The same `IProtocol` subclass runs there; the authoritative interface spec is `.claude/docs/protocol-lifecycle.md` in that project.
+- `→ /home/fleury/Documents/lac/uav_api/.claude/docs/specification.md` — **authoritative** HTTP contract for every endpoint this project hits on `localhost:uav_api_port`. Update it first if you add or change a command.

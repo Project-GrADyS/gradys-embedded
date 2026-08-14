@@ -92,26 +92,98 @@ configuration = RunnerConfiguration(
     origin_gps_coordinates=(-15.840081, -47.926642, 0.0),
 )
 
-runner = EmbeddedRunner(configuration, MyProtocol)
+runner = EmbeddedRunner(configuration)
 runner.start_api()
 ```
 
-`start_api()` is the only public entry point. It owns the asyncio loop and serves **two** servers — a control plane and a data plane on separate ports:
+Or, more usually on a drone, as a service:
 
-- **Control plane** (`control_api_port`, always plain HTTP):
-  - `POST /protocol/setup` — arms the drone, takes off, and flies to `initial_position`.
-  - `POST /protocol/start` — instantiates the protocol, calls `initialize()`, and starts the telemetry polling loop.
+```bash
+gradys-embedded --config /etc/gradys/embedded.toml
+```
+
+`start_api()` owns the asyncio loop and serves **two** servers — a control plane and a data plane on separate ports:
+
+- **Control plane** (`control_api_port`, always plain HTTP): `/protocol s`, `/mission` and `/runs` — see [Mission API](#mission-api).
 - **Data plane** (the `node_ip_dict` port, transport per `communication_protocol`):
   - `POST /message` — inter-node delivery for http/https/http3 (forwarded to `handle_packet`); under `"zenoh_tcp"`/`"zenoh_quic"` a Zenoh peer session carries messages instead.
 
-After launching the runner, an external client (operator console, sitl-tester, `curl`) drives the drone end-to-end via the **control port**:
-
-```bash
-curl -X POST http://<drone>:<control_api_port>/protocol/setup
-curl -X POST http://<drone>:<control_api_port>/protocol/start
-```
+**The service boots idle and flies nothing until told to.** A protocol named in
+the configuration is a default suggestion, not an autostart — a drone that
+reboots in the field must never spontaneously arm.
 
 Each node in the network runs its own instance of `EmbeddedRunner` with a unique `node_id`.
+
+## Mission API
+
+The service stays up across missions: load a protocol, fly it, stop it, and load
+a different one without restarting anything. Only one mission runs at a time.
+
+```
+IDLE ──load──▶ LOADED ──setup──▶ READY ──start──▶ RUNNING ──stop──▶ RETURNING ──▶ IDLE
+```
+
+```bash
+BASE=http://<drone>:<control_api_port>
+
+curl -F file=@my_protocol.py $BASE/protocols/upload
+curl -X POST $BASE/mission/load -H 'Content-Type: application/json' \
+     -d '{"protocol": "my_protocol", "label": "sweep-3"}'
+curl -X POST $BASE/mission/setup    # arm, take off, fly to initial_position
+curl -X POST $BASE/mission/start
+curl $BASE/mission/status           # state + live tracked_variables
+curl -X POST $BASE/mission/stop     # flush data, then return to launch
+```
+
+| Method | Path | Purpose |
+|---|---|---|
+| POST | `/protocols/upload` | Upload a `.py` protocol module |
+| GET | `/protocols` | List available protocols |
+| DELETE | `/protocols/{name}` | Remove an uploaded protocol |
+| POST | `/mission/load` | Select a protocol and transport, and open a run directory |
+| POST | `/mission/setup` | Arm, take off, fly to the initial position |
+| POST | `/mission/start` | Instantiate the protocol and begin |
+| POST | `/mission/stop` | End the protocol, flush its data, return to launch |
+| GET | `/mission/status` | State, run id, elapsed time, live `tracked_variables` |
+| GET | `/runs` | List runs held on the drone, with disk usage |
+| GET | `/runs/{id}` | Manifest: files, sizes, outcome |
+| GET | `/runs/{id}/files/{name}` | Download one file |
+| GET | `/runs/{id}/archive` | Download the whole run as `.tar.gz` |
+| DELETE | `/runs/{id}` | Delete a run to reclaim space |
+
+`setup` and `start` are separate so a fleet can reach its initial positions
+before any protocol begins.
+
+**The transport is chosen at load, and only the chosen one is served.** The data
+plane binds nothing until a mission loads; a mission on a different transport
+rebinds the same port, and consecutive missions on the same transport reuse the
+listener. Load rejects a transport the drone cannot serve — unknown name, a
+missing optional extra, or `zenoh_quic` without a fleet-wide certificate — rather
+than accepting it and failing inside a server nobody is watching.
+
+`stop` returns immediately: it finishes the protocol and flushes the run first,
+then issues RTL fire-and-forget, because `uav_api`'s `/command/rtl` blocks until
+the vehicle is home *and* disarmed. Status reports `returning` until the drone
+lands. A stopped protocol can no longer command the vehicle or send messages, so
+it cannot fight the return.
+
+### Run data
+
+Each mission gets `{runs_dir}/run_<timestamp>[_label]/` containing its statistics
+CSVs, `resource_usage.csv`, a per-run `runner.log`, and `RUN_INFO.json` recording
+the protocol, coordinate frame and outcome. Data is written periodically as well
+as at stop, so an unclean shutdown costs seconds of samples rather than the whole
+flight.
+
+Nothing is ever deleted automatically. Below `min_free_disk_mb` the service
+refuses to open a new run (HTTP 507) rather than pruning an uncollected flight.
+
+### Legacy endpoints
+
+`POST /protocol/setup` and `POST /protocol/start` still work. When the runner was
+constructed with a protocol class and no mission has been loaded, setup loads
+that protocol first — reproducing the original "construct with a protocol, POST
+setup, POST start" flow.
 
 ## Configuration Parameters
 
@@ -122,8 +194,12 @@ The `RunnerConfiguration` dataclass controls how the runner connects to the UAV 
 | `node_id` | `int` | *required* | Unique identifier for this node in the network. Must match a key in `node_ip_dict`. |
 | `node_ip_dict` | `dict[int, str]` | *required* | Maps every node ID in the network to its `ip:port` address for inter-node messaging. Each node uses this to know where to send messages. |
 | `uav_api_port` | `int` | *required* | Port of the local UAV HTTP API (e.g. ArduPilot HTTP interface) running on `localhost`. Used for telemetry polling and sending mobility commands. |
-| `control_api_port` | `int` | *required* | Dedicated plain-HTTP port for the control plane (`POST /protocol/setup`, `POST /protocol/start`). Separate from the data-plane message port so the latter belongs entirely to the transport. Must be unique per node on a shared host. |
-| `initial_position` | `tuple[float, float, float]` | *required* | Cartesian `(x, y, z)` target the drone flies to during `POST /protocol/setup` (after arm + takeoff). |
+| `control_api_port` | `int` | *required* | Dedicated plain-HTTP port for the control plane (`/mission`, `/protocols`, `/runs`). Separate from the data-plane message port so the latter belongs entirely to the transport. Must be unique per node on a shared host. |
+| `initial_position` | `tuple[float, float, float]` | *required* | Default Cartesian `(x, y, z)` target the drone flies to during `POST /mission/setup` (after arm + takeoff). A mission may override it per run. |
+| `runs_dir` | `str` | `~/gradys_runs` | Directory holding one subdirectory per mission run. Served by `GET /runs`. |
+| `protocols_dir` | `str` | `~/gradys_protocols` | Where uploaded protocols are written; added to `sys.path` so they import by module name. |
+| `min_free_disk_mb` | `int` | `200` | Refuse to open a new run below this much free space. `0` disables the check. |
+| `telemetry_landed_alt` | `float` | `0.5` | Relative altitude below which the vehicle counts as landed, which is how a `returning` mission closes out. |
 | `origin_gps_coordinates` | `tuple[float, float, float] \| None` | `None` | Reference GPS point `(latitude, longitude, altitude)` used as the origin for converting between GPS and cartesian coordinates. All nodes in the network must share the same origin. If `None`, the drone's current position at boot is used. |
 | `x_axis_degrees` | `float \| None` | `None` | Clockwise rotation of the protocol's x-axis from true north, in degrees (`0.0` keeps the NEU convention: x=North, y=East). Must be identical on every node. If `None`, it is taken from the drone's heading at boot. |
 | `telemetry_interval` | `float` | `0.5` | Seconds between GPS telemetry polls from the UAV API. Lower values give more responsive position updates but increase load on the UAV API. |
@@ -239,7 +315,9 @@ GrADyS-Embedded is structured as a layered system that bridges protocol logic to
 
 ### Components
 
-**Runner** (`EmbeddedRunner`) -- The entry point. Exposes a single public method, `start_api()`, which creates the asyncio event loop and serves two concurrent servers: a control plane (`/protocol/setup`, `/protocol/start`) on `control_api_port`, and a data plane (`/message`, or a Zenoh peer session) on the `node_ip_dict` port. `/protocol/setup` arms and takes off; `/protocol/start` bootstraps the encapsulator, calls the protocol's `initialize`, and begins the telemetry polling loop.
+**Runner** (`EmbeddedRunner`) -- The entry point. `start_api()` creates the asyncio event loop and serves two concurrent servers: a control plane (`/mission`, `/protocols`, `/runs`) on `control_api_port`, and a data plane (`/message`, or a Zenoh peer session) on the `node_ip_dict` port. The runner owns everything process-scoped — loop, shared HTTP session, transport backend, telemetry poll — and delegates anything per-mission to the `MissionManager`.
+
+**Mission manager** (`gradys_embedded/runner/mission.py`) -- Owns the mission state machine, the run directory, protocol resolution and the hot swap. Because both transports read `runner._encapsulator` per delivery, rebinding it swaps the protocol atomically without rebinding any port.
 
 **Encapsulator** (`EmbeddedEncapsulator`) -- Wraps a protocol instance and connects it to the embedded provider. Delegates all lifecycle events (`initialize`, `handle_timer`, `handle_packet`, `handle_telemetry`, `finish`) to the protocol.
 
@@ -251,7 +329,7 @@ GrADyS-Embedded is structured as a layered system that bridges protocol logic to
 
 **Communication backends** (`gradys_embedded/communication/`) -- One `CommunicationBackend` per transport, built by `create_backend(runner)`. Each owns both the data-plane *serve* (receive) side and the *send*/*broadcast* side: `http.py` covers `http`/`https`/`http3` (the `/message` FastAPI app + peer POSTs), `zenoh.py` covers `zenoh_tcp`/`zenoh_quic` (Zenoh peer session, no `/message` server). `certs.py` provides TLS material.
 
-**Control API** (`gradys_embedded/runner/control_panel.py`) -- The `create_control_app` FastAPI application (`POST /protocol/setup`, `POST /protocol/start`) served on `control_api_port`, driving the runner's lifecycle from outside the process. Always plain HTTP, independent of `communication_protocol`. The `/message` data-plane app lives with the HTTP backend in `communication/http.py`.
+**Control API** (`gradys_embedded/runner/control_panel.py`) -- The `create_control_app` FastAPI application: `/protocols`, `/mission` and `/runs`, plus the legacy `/protocol/setup` and `/protocol/start` aliases. Served on `control_api_port`, driving mission lifecycle from outside the process. Always plain HTTP, independent of `communication_protocol`. The `/message` data-plane app lives with the HTTP backend in `communication/http.py`.
 
 **Position Utilities** -- Functions for converting between GPS coordinates and a local cartesian frame (North-East-Up) using haversine distance calculations. All nodes must share the same `origin_gps_coordinates` so their cartesian frames are consistent.
 

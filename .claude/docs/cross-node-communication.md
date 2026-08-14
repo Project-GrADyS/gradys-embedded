@@ -159,4 +159,4 @@ If you need authentication, wrap the payload in a signed envelope at the protoco
 - `→ .claude/docs/runtime-model.md` — when uvicorn (and therefore the `/message` router) starts listening relative to `/protocol/start` and `initialize()`.
 - `→ .claude/docs/configuration.md` — `node_ip_dict` shape and shared-origin requirement.
 - `→ .claude/docs/protocol-interface.md` — how `handle_packet` is invoked on the asyncio loop.
-- `→ /home/fleury/gradys/major_projects/gradys-sim-nextgen/.claude/docs/messages-and-telemetry.md` — the abstract `CommunicationCommand` types (SEND, BROADCAST).
+- `→ https://github.com/Project-GrADyS/gradys-sim-nextgen/.claude/docs/messages-and-telemetry.md` — the abstract `CommunicationCommand` types (SEND, BROADCAST).

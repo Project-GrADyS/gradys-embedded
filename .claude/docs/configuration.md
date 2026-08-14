@@ -162,4 +162,4 @@ The reference example (`examples/simple/ge.py`) hard-codes configuration; produc
 - `→ .claude/docs/runtime-model.md` — how `start_api`, `/protocol/setup`, and `/protocol/start` sequence, and what each does with the config.
 - `→ .claude/docs/mobility-and-telemetry.md` — what `origin_gps_coordinates` and `telemetry_interval` actually control.
 - `→ .claude/docs/cross-node-communication.md` — how `node_ip_dict` is used on both the server and client sides.
-- `→ /home/fleury/gradys/major_projects/uav_api/.claude/docs/specification.md` — authoritative endpoint spec for the calls `/protocol/setup` makes.
+- `→ /home/fleury/Documents/lac/uav_api/.claude/docs/specification.md` — authoritative endpoint spec for the calls `/protocol/setup` makes.
