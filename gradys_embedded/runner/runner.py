@@ -193,6 +193,10 @@ class EmbeddedRunner:
     # cannot hold up a mission.
     BACKEND_STOP_TIMEOUT = 5.0
 
+    # How long a transport gets to bind before its mission's load fails. Binding
+    # is local and fast; this only trips when something is genuinely wedged.
+    BACKEND_START_TIMEOUT = 10.0
+
     def _backend_signature(self, configuration: RunnerConfiguration) -> tuple:
         """What must match for a running backend to be reusable.
 
@@ -226,6 +230,36 @@ class EmbeddedRunner:
         self._backend_signature_current = signature
         self._backend_task = self._loop.create_task(backend.serve())
         self._backend_task.add_done_callback(self._on_backend_finished)
+
+        # A successful return here must mean the fleet can rely on this node
+        # listening. serve() runs in its own task, so race its death against the
+        # backend's ready signal -- a port conflict or bad TLS material becomes
+        # a failure the caller sees, not a log line in a task nobody awaits.
+        serve_task = self._backend_task
+        ready = self._loop.create_task(backend.wait_ready())
+        try:
+            done, _ = await asyncio.wait(
+                {serve_task, ready},
+                timeout=self.BACKEND_START_TIMEOUT,
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+        finally:
+            ready.cancel()
+        if serve_task in done:
+            # exception() returns BaseExceptions too -- uvicorn exits a failed
+            # bind with SystemExit, which must surface here, not escape.
+            exc = serve_task.exception()
+            await self.stop_backend()
+            raise RuntimeError(
+                f"{configuration.communication_protocol} data plane exited before "
+                f"becoming ready on port {configuration.resolve_data_port()}: {exc!r}"
+            )
+        if not done:
+            await self.stop_backend()
+            raise RuntimeError(
+                f"{configuration.communication_protocol} data plane did not become "
+                f"ready within {self.BACKEND_START_TIMEOUT}s"
+            )
         self._logger.info(
             f"Data plane serving {configuration.communication_protocol} "
             f"on port {configuration.resolve_data_port()}"

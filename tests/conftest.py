@@ -9,6 +9,7 @@ import asyncio
 
 import pytest
 
+from gradys_embedded.communication import ZENOH_PROTOCOLS
 from gradys_embedded.encapsulator.embedded import EmbeddedEncapsulator
 from gradys_embedded.runner.configuration import RunnerConfiguration
 from gradys_embedded.runner.mission import MissionManager
@@ -59,8 +60,14 @@ class StubRunner:
         return configuration
 
     async def start_backend(self, configuration):
+        # Mirrors EmbeddedRunner._backend_signature, zenoh branch included: a
+        # zenoh mission that changes only its peer map or auto_scout rebinds in
+        # production, so the stub must not count it as a reuse.
         signature = (configuration.communication_protocol,
                      configuration.certfile, configuration.keyfile)
+        if configuration.communication_protocol in ZENOH_PROTOCOLS:
+            peers = tuple(sorted((configuration.node_ip_dict or {}).items()))
+            signature += (configuration.auto_scout, peers)
         if self._backend_signature == signature:
             self.backend_reuses += 1
             return

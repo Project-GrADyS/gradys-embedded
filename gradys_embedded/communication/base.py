@@ -33,6 +33,21 @@ class CommunicationBackend(ABC):
         # unreferenced fire-and-forget send can be garbage-collected before it
         # completes. Hold them until they finish.
         self._pending_tasks: set[asyncio.Task] = set()
+        # Set by serve() once the listener is actually bound/open, so the runner
+        # can await readiness instead of assuming the serve task got that far.
+        self._ready = asyncio.Event()
+
+    def _signal_ready(self) -> None:
+        self._ready.set()
+
+    async def wait_ready(self) -> None:
+        """Blocks until :meth:`serve` has bound/opened its listener.
+
+        Backends with no positive bind signal may set readiness after a short
+        grace period instead; a failed bind kills the serve task, which the
+        runner races against this wait.
+        """
+        await self._ready.wait()
 
     @property
     def _port(self) -> int:

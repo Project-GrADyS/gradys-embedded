@@ -115,6 +115,9 @@ class ZenohBackend(CommunicationBackend):
             f"auto_scout={self._configuration.auto_scout}{cert_note}); "
             f"subscribed to gradys/msg/{node_id} and gradys/msg/broadcast"
         )
+        # zenoh.open and the subscriber declarations above are synchronous and
+        # raise directly, so reaching this point means the session is live.
+        self._signal_ready()
         # Keep the data plane alive until close(). Rebuilding the session per
         # mission is also what lets a mission supply a different peer map --
         # zenoh fixes its connect endpoints when the session opens, so a

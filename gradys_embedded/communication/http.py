@@ -77,6 +77,12 @@ class HttpBackend(CommunicationBackend):
         self._peer_ssl = ssl.create_default_context(cafile=self._peer_certfile) if self._peer_certfile else False
         self._h3_session = None
 
+    # Hypercorn exposes no bind signal; it binds inside serve()'s first
+    # iterations and raises promptly when it cannot, so readiness is declared
+    # after this grace period instead. A bind failure kills the serve task well
+    # inside the window and wins the race in start_backend.
+    HTTP3_READY_GRACE = 0.5
+
     async def _run_uvicorn(self, config: uvicorn.Config) -> None:
         server = uvicorn.Server(config)
         # Several servers share this loop (control plane + data plane); let the runner's own
@@ -84,10 +90,20 @@ class HttpBackend(CommunicationBackend):
         # process-wide signal handlers.
         server.install_signal_handlers = lambda: None
         self._server = server
+        # uvicorn has no bind callback either, but `started` flips at the end of
+        # its startup, after the listening socket exists; a failed bind raises
+        # SystemExit out of serve() instead, and the watcher dies unfired.
+        watcher = asyncio.get_running_loop().create_task(self._watch_started(server))
         try:
             await server.serve()
         finally:
+            watcher.cancel()
             self._server = None
+
+    async def _watch_started(self, server: uvicorn.Server) -> None:
+        while not server.started:
+            await asyncio.sleep(0.02)
+        self._signal_ready()
 
     async def serve(self) -> None:
         if self._protocol == "http":
@@ -108,10 +124,16 @@ class HttpBackend(CommunicationBackend):
             config.quic_bind = [f"0.0.0.0:{self._port}"]
             config.certfile = self._certfile
             config.keyfile = self._keyfile
-            # Hypercorn must never install its own signal handlers -- the runner
-            # owns the loop -- but it does need a way out, so close() can hand the
-            # port to the next mission's transport.
-            await serve(self._app, config, shutdown_trigger=self._stop.wait)
+            ready_timer = asyncio.get_running_loop().call_later(
+                self.HTTP3_READY_GRACE, self._signal_ready
+            )
+            try:
+                # Hypercorn must never install its own signal handlers -- the runner
+                # owns the loop -- but it does need a way out, so close() can hand the
+                # port to the next mission's transport.
+                await serve(self._app, config, shutdown_trigger=self._stop.wait)
+            finally:
+                ready_timer.cancel()
 
     def send(self, dest_node_id: int, payload: dict) -> None:
         dest_addr = self._configuration.node_ip_dict.get(dest_node_id)
