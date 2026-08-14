@@ -476,6 +476,31 @@ class MissionManager:
             self._finalize_run()
         return status
 
+    async def reset(self) -> dict:
+        """Operator escape hatch: force the mission state machine back to IDLE.
+
+        Allowed from any non-IDLE state. Finalizes the run with outcome
+        "reset", tears down the protocol if one is live, and does NOT command
+        the vehicle: an RTL already issued keeps flying, and a vehicle still
+        airborne stays airborne. Exists because the only ordinary exit from
+        RETURNING is the telemetry loop's landing detection -- a broken poll
+        must not strand the service until a field power-cycle.
+        """
+        if self.state is MissionState.IDLE:
+            raise MissionError("Nothing to reset; state is idle")
+
+        self._runner.teardown_protocol()
+        self._stop_resource_monitor()
+        self._started_at = None
+        self.state = MissionState.IDLE
+        self._write_run_info(outcome="reset")
+        self._logger.warning(
+            f"Mission {self.run_id} force-reset to idle; the vehicle was NOT commanded"
+        )
+        status = self.status()
+        self._finalize_run()
+        return status
+
     def note_landed(self) -> None:
         """Called by the telemetry loop once the vehicle is back on the ground."""
         if self.state is not MissionState.RETURNING:

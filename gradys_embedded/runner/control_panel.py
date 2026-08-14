@@ -139,6 +139,13 @@ def _build_mission_router(runner: "EmbeddedRunner") -> APIRouter:
         except MissionError as exc:
             raise _handle(exc)
 
+    @router.post("/reset", summary="Force the mission back to idle (does NOT command the vehicle)")
+    async def reset():
+        try:
+            return await _mission(runner).reset()
+        except MissionError as exc:
+            raise _handle(exc)
+
     return router
 
 

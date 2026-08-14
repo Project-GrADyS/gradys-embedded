@@ -29,7 +29,7 @@ def test_control_surface_has_no_legacy_endpoints(runner):
     assert "/protocol/setup" not in paths
     assert "/protocol/start" not in paths
     for path in ["/mission/load", "/mission/setup", "/mission/start",
-                 "/mission/stop", "/mission/status",
+                 "/mission/stop", "/mission/reset", "/mission/status",
                  "/protocols", "/protocols/upload",
                  "/runs", "/runs/{run_id}", "/runs/{run_id}/archive",
                  "/runs/{run_id}/files/{filename}"]:
