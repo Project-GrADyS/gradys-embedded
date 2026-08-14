@@ -30,12 +30,15 @@ _QUIC_PROTOCOL = "zenoh_quic"
 
 
 class ZenohBackend(CommunicationBackend):
-    def __init__(self, runner: "EmbeddedRunner") -> None:
-        super().__init__(runner)
+    def __init__(self, runner: "EmbeddedRunner", configuration=None) -> None:
+        super().__init__(runner, configuration)
         self._is_quic = self._configuration.communication_protocol == _QUIC_PROTOCOL
         self._scheme = "quic" if self._is_quic else "tcp"
         self._session = None
         self._subscribers: list = []
+        # Releases serve(). The transport is a mission parameter, so this session
+        # lasts for a mission rather than the process.
+        self._stop = asyncio.Event()
 
     def _build_config(self):
         """Build a Zenoh peer-mode Config. Option A (auto_scout) uses multicast scouting; Option B
@@ -112,8 +115,11 @@ class ZenohBackend(CommunicationBackend):
             f"auto_scout={self._configuration.auto_scout}{cert_note}); "
             f"subscribed to gradys/msg/{node_id} and gradys/msg/broadcast"
         )
-        # Keep the data plane alive for the lifetime of the runner.
-        await asyncio.Future()
+        # Keep the data plane alive until close(). Rebuilding the session per
+        # mission is also what lets a mission supply a different peer map --
+        # zenoh fixes its connect endpoints when the session opens, so a
+        # long-lived session could never pick one up.
+        await self._stop.wait()
 
     def send(self, dest_node_id: int, payload: dict) -> None:
         self._publish(f"gradys/msg/{dest_node_id}", payload)
@@ -130,5 +136,15 @@ class ZenohBackend(CommunicationBackend):
             self._logger.error(f"Zenoh put to {key!r} failed: {e}")
 
     async def close(self) -> None:
+        self._stop.set()
+        for subscriber in self._subscribers:
+            try:
+                subscriber.undeclare()
+            except Exception as e:
+                # Dropped with the session anyway; never let teardown of one
+                # transport block the next one from binding.
+                self._logger.debug(f"Subscriber undeclare failed: {e}")
+        self._subscribers = []
         if self._session is not None:
             self._session.close()
+            self._session = None

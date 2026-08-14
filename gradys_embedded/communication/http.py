@@ -51,22 +51,19 @@ def build_message_app(runner: "EmbeddedRunner") -> FastAPI:
     return app
 
 
-async def _run_uvicorn(config: uvicorn.Config) -> None:
-    server = uvicorn.Server(config)
-    # Several servers share this loop (control plane + data plane); let the runner's own
-    # KeyboardInterrupt handling own shutdown instead of each server racing to install
-    # process-wide signal handlers.
-    server.install_signal_handlers = lambda: None
-    await server.serve()
-
-
 class HttpBackend(CommunicationBackend):
     """Serves ``/message`` over HTTP/HTTPS/HTTP3 and sends to peers over the matching scheme."""
 
-    def __init__(self, runner: "EmbeddedRunner") -> None:
-        super().__init__(runner)
+    def __init__(self, runner: "EmbeddedRunner", configuration=None) -> None:
+        super().__init__(runner, configuration)
         self._protocol = self._configuration.communication_protocol
         self._app = build_message_app(runner)
+
+        # Held so close() can release the listener: the transport is chosen per
+        # mission, so this server has to give the port back when the next
+        # mission picks a different one.
+        self._server: uvicorn.Server | None = None
+        self._stop = asyncio.Event()
 
         # Server-side TLS material (https/http3 only).
         self._certfile: str | None = None
@@ -80,16 +77,28 @@ class HttpBackend(CommunicationBackend):
         self._peer_ssl = ssl.create_default_context(cafile=self._peer_certfile) if self._peer_certfile else False
         self._h3_session = None
 
+    async def _run_uvicorn(self, config: uvicorn.Config) -> None:
+        server = uvicorn.Server(config)
+        # Several servers share this loop (control plane + data plane); let the runner's own
+        # KeyboardInterrupt handling own shutdown instead of each server racing to install
+        # process-wide signal handlers.
+        server.install_signal_handlers = lambda: None
+        self._server = server
+        try:
+            await server.serve()
+        finally:
+            self._server = None
+
     async def serve(self) -> None:
         if self._protocol == "http":
             config = uvicorn.Config(self._app, host="0.0.0.0", port=self._port, loop="asyncio")
-            await _run_uvicorn(config)
+            await self._run_uvicorn(config)
         elif self._protocol == "https":
             config = uvicorn.Config(
                 self._app, host="0.0.0.0", port=self._port, loop="asyncio",
                 ssl_certfile=self._certfile, ssl_keyfile=self._keyfile,
             )
-            await _run_uvicorn(config)
+            await self._run_uvicorn(config)
         elif self._protocol == "http3":
             from hypercorn.config import Config
             from hypercorn.asyncio import serve
@@ -99,8 +108,10 @@ class HttpBackend(CommunicationBackend):
             config.quic_bind = [f"0.0.0.0:{self._port}"]
             config.certfile = self._certfile
             config.keyfile = self._keyfile
-            # The runner's event loop owns the lifecycle; never let Hypercorn self-shutdown.
-            await serve(self._app, config, shutdown_trigger=lambda: asyncio.Future())
+            # Hypercorn must never install its own signal handlers -- the runner
+            # owns the loop -- but it does need a way out, so close() can hand the
+            # port to the next mission's transport.
+            await serve(self._app, config, shutdown_trigger=self._stop.wait)
 
     def send(self, dest_node_id: int, payload: dict) -> None:
         dest_addr = self._configuration.node_ip_dict.get(dest_node_id)
@@ -147,5 +158,11 @@ class HttpBackend(CommunicationBackend):
             self._logger.error(f"POST {url} failed: {e}")
 
     async def close(self) -> None:
+        # Releases the listening port. Without this the next mission's transport
+        # cannot bind, and the http3 path would never return at all.
+        self._stop.set()
+        if self._server is not None:
+            self._server.should_exit = True
         if self._h3_session is not None:
             await self._h3_session.close()
+            self._h3_session = None
