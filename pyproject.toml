@@ -7,7 +7,7 @@ include = ["gradys_embedded*"]
 
 [project]
 name = "gradys_embedded"
-version = "0.0.1"
+version = "0.1.0"
 description = "Runs GrADyS-Sim nextgen protocols in real quadcopter"
 keywords = ["mavlink", "http", "real", "gradys", "LAC", "PUC", "drone", "ardupilot", "GrADyS", "reactive"]
 authors = [
