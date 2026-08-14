@@ -1,0 +1,58 @@
+# Reference systemd unit for running a GrADyS protocol on a drone.
+#
+# This is the canonical copy. Fleet deployments render it from a template in
+# gradys-fleet (roles/gradys_embedded/templates/gradys-embedded.service.j2) --
+# keep the two in step when changing either.
+#
+# Placeholders: __USER__ __VENV__ __CONFIG__ __RUNDIR__ __PROTOCOLS__
+#
+# Four directives here are load-bearing and easy to drop by accident. Each is
+# explained inline; removing any of them fails in a way the symptom does not
+# point at.
+
+[Unit]
+Description=GrADyS Embedded protocol runner
+Documentation=https://github.com/Project-GrADyS/gradys-embedded
+Requires=uav-api.service
+After=uav-api.service
+
+[Service]
+Type=simple
+User=__USER__
+Group=__USER__
+# (1) The service owns its run directories under runs_dir and writes each
+# mission's data there, so the working directory no longer decides where data
+# lands. Point it somewhere stable that the service user can read.
+WorkingDirectory=__RUNDIR__
+Environment=PATH=__VENV__/bin:/usr/local/bin:/usr/bin:/bin
+# The protocol named in the config file is imported from here.
+Environment=PYTHONPATH=__PROTOCOLS__
+
+# (2) No readiness gate on uav_api. The service does not touch it at boot -- the
+# coordinate frame is resolved at mission load -- so it comes up and serves its
+# control plane regardless. Gating startup on uav_api would make an unhealthy
+# drone unreachable to its mission layer, which is when you most need to reach
+# it. Failures surface at /mission/setup, over HTTP.
+
+ExecStart=__VENV__/bin/gradys-embedded --config __CONFIG__
+
+# (3) The statistics plugin flushes its CSVs from the shutdown handler, which
+# only runs on SIGINT. Run data is also written periodically, so an unclean kill
+# costs seconds of samples rather than the whole flight -- but a clean stop is
+# what closes a run out properly.
+KillSignal=SIGINT
+TimeoutStopSec=30
+
+# (4) Deliberately NOT Restart=always. A protocol runner that silently restarts
+# mid-mission has lost all protocol state and rejoins in a state the rest of the
+# fleet does not expect -- worse than being visibly down.
+Restart=on-failure
+RestartSec=10
+StartLimitBurst=3
+
+SyslogIdentifier=gradys-embedded
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

@@ -6,12 +6,15 @@ from protocol import SimpleUAVProtocol
 if __name__ == "__main__":
     runner_configuration = RunnerConfiguration(
         node_id=1,
+        # Bare "host:port" -- no scheme. The transport builds
+        # f"http://{addr}/message" itself, so a scheme here yields
+        # "http://http://..." and every send fails silently.
         node_ip_dict={
-            1: "http://localhost:5000",
-            2: "http://localhost:5001",
-            3: "http://localhost:5002",
-            4: "http://localhost:5003",
-            5: "http://localhost:5004",
+            1: "localhost:5000",
+            2: "localhost:5001",
+            3: "localhost:5002",
+            4: "localhost:5003",
+            5: "localhost:5004",
         },
         uav_api_port=8000,
         control_api_port=6000,

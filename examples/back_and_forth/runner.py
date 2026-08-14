@@ -6,8 +6,11 @@ from protocol import BackAndForthProtocol
 if __name__ == "__main__":
     runner_configuration = RunnerConfiguration(
         node_id=0,
+        # Bare "host:port" -- no scheme. The transport builds
+        # f"http://{addr}/message" itself, so a scheme here yields
+        # "http://http://..." and every send fails silently.
         node_ip_dict={
-            0: "http://localhost:5000",
+            0: "localhost:5000",
         },
         uav_api_port=8000,
         control_api_port=6000,
