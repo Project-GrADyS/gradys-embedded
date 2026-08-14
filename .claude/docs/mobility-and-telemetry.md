@@ -118,5 +118,5 @@ Pattern: issue the command, wait for telemetry to report arrival, issue the next
 - `→ .claude/docs/configuration.md` — `origin_gps_coordinates` invariant, `initial_position`, `telemetry_interval`.
 - `→ .claude/docs/runtime-model.md` — when the telemetry loop and setup movement run.
 - `→ .claude/docs/encapsulator-interface.md` — the fire-and-forget task mechanism used by mobility commands.
-- `→ /home/fleury/gradys/major_projects/uav_api/.claude/docs/specification.md` — authoritative contract for `/movement/go_to_gps`, `/command/set_air_speed`, and `/telemetry/gps`.
-- `→ /home/fleury/gradys/major_projects/gradys-sim-nextgen/.claude/docs/messages-and-telemetry.md` — the abstract shapes (`MobilityCommand`, `Telemetry`, `Position`, `geo_to_cartesian`) that this project implements.
+- `→ /home/fleury/Documents/lac/uav_api/.claude/docs/specification.md` — authoritative contract for `/movement/go_to_gps`, `/command/set_air_speed`, and `/telemetry/gps`.
+- `→ https://github.com/Project-GrADyS/gradys-sim-nextgen/blob/main/.claude/docs/messages-and-telemetry.md` — the abstract shapes (`MobilityCommand`, `Telemetry`, `Position`, `geo_to_cartesian`) that this project implements.

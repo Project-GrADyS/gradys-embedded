@@ -51,22 +51,19 @@ def build_message_app(runner: "EmbeddedRunner") -> FastAPI:
     return app
 
 
-async def _run_uvicorn(config: uvicorn.Config) -> None:
-    server = uvicorn.Server(config)
-    # Several servers share this loop (control plane + data plane); let the runner's own
-    # KeyboardInterrupt handling own shutdown instead of each server racing to install
-    # process-wide signal handlers.
-    server.install_signal_handlers = lambda: None
-    await server.serve()
-
-
 class HttpBackend(CommunicationBackend):
     """Serves ``/message`` over HTTP/HTTPS/HTTP3 and sends to peers over the matching scheme."""
 
-    def __init__(self, runner: "EmbeddedRunner") -> None:
-        super().__init__(runner)
+    def __init__(self, runner: "EmbeddedRunner", configuration) -> None:
+        super().__init__(runner, configuration)
         self._protocol = self._configuration.communication_protocol
         self._app = build_message_app(runner)
+
+        # Held so close() can release the listener: the transport is chosen per
+        # mission, so this server has to give the port back when the next
+        # mission picks a different one.
+        self._server: uvicorn.Server | None = None
+        self._stop = asyncio.Event()
 
         # Server-side TLS material (https/http3 only).
         self._certfile: str | None = None
@@ -80,16 +77,44 @@ class HttpBackend(CommunicationBackend):
         self._peer_ssl = ssl.create_default_context(cafile=self._peer_certfile) if self._peer_certfile else False
         self._h3_session = None
 
+    # Hypercorn exposes no bind signal; it binds inside serve()'s first
+    # iterations and raises promptly when it cannot, so readiness is declared
+    # after this grace period instead. A bind failure kills the serve task well
+    # inside the window and wins the race in start_backend.
+    HTTP3_READY_GRACE = 0.5
+
+    async def _run_uvicorn(self, config: uvicorn.Config) -> None:
+        server = uvicorn.Server(config)
+        # Several servers share this loop (control plane + data plane); let the runner's own
+        # KeyboardInterrupt handling own shutdown instead of each server racing to install
+        # process-wide signal handlers.
+        server.install_signal_handlers = lambda: None
+        self._server = server
+        # uvicorn has no bind callback either, but `started` flips at the end of
+        # its startup, after the listening socket exists; a failed bind raises
+        # SystemExit out of serve() instead, and the watcher dies unfired.
+        watcher = asyncio.get_running_loop().create_task(self._watch_started(server))
+        try:
+            await server.serve()
+        finally:
+            watcher.cancel()
+            self._server = None
+
+    async def _watch_started(self, server: uvicorn.Server) -> None:
+        while not server.started:
+            await asyncio.sleep(0.02)
+        self._signal_ready()
+
     async def serve(self) -> None:
         if self._protocol == "http":
             config = uvicorn.Config(self._app, host="0.0.0.0", port=self._port, loop="asyncio")
-            await _run_uvicorn(config)
+            await self._run_uvicorn(config)
         elif self._protocol == "https":
             config = uvicorn.Config(
                 self._app, host="0.0.0.0", port=self._port, loop="asyncio",
                 ssl_certfile=self._certfile, ssl_keyfile=self._keyfile,
             )
-            await _run_uvicorn(config)
+            await self._run_uvicorn(config)
         elif self._protocol == "http3":
             from hypercorn.config import Config
             from hypercorn.asyncio import serve
@@ -99,18 +124,36 @@ class HttpBackend(CommunicationBackend):
             config.quic_bind = [f"0.0.0.0:{self._port}"]
             config.certfile = self._certfile
             config.keyfile = self._keyfile
-            # The runner's event loop owns the lifecycle; never let Hypercorn self-shutdown.
-            await serve(self._app, config, shutdown_trigger=lambda: asyncio.Future())
+            ready_timer = asyncio.get_running_loop().call_later(
+                self.HTTP3_READY_GRACE, self._signal_ready
+            )
+            try:
+                # Hypercorn must never install its own signal handlers -- the runner
+                # owns the loop -- but it does need a way out, so close() can hand the
+                # port to the next mission's transport.
+                await serve(self._app, config, shutdown_trigger=self._stop.wait)
+            finally:
+                ready_timer.cancel()
 
     def send(self, dest_node_id: int, payload: dict) -> None:
-        dest_addr = self._configuration.node_ip_dict.get(dest_node_id)
+        # Load-time validation makes a missing map unreachable; guarded anyway
+        # because dropping a send beats crashing a flying protocol.
+        peers = self._configuration.node_ip_dict
+        if not peers:
+            self._logger.warning(f"No peer map for this mission; dropping send to node {dest_node_id}")
+            return
+        dest_addr = peers.get(dest_node_id)
         if dest_addr is None:
             self._logger.warning(f"Unknown destination node {dest_node_id}")
             return
         self._fire_and_forget(self._send_to_peer(dest_addr, payload))
 
     def broadcast(self, payload: dict) -> None:
-        for nid, addr in self._configuration.node_ip_dict.items():
+        peers = self._configuration.node_ip_dict
+        if not peers:
+            self._logger.warning("No peer map for this mission; dropping broadcast")
+            return
+        for nid, addr in peers.items():
             if nid != self._configuration.node_id:
                 self._fire_and_forget(self._send_to_peer(addr, payload))
 
@@ -147,5 +190,11 @@ class HttpBackend(CommunicationBackend):
             self._logger.error(f"POST {url} failed: {e}")
 
     async def close(self) -> None:
+        # Releases the listening port. Without this the next mission's transport
+        # cannot bind, and the http3 path would never return at all.
+        self._stop.set()
+        if self._server is not None:
+            self._server.should_exit = True
         if self._h3_session is not None:
             await self._h3_session.close()
+            self._h3_session = None

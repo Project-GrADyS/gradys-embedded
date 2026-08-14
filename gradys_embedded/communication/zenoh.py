@@ -30,12 +30,15 @@ _QUIC_PROTOCOL = "zenoh_quic"
 
 
 class ZenohBackend(CommunicationBackend):
-    def __init__(self, runner: "EmbeddedRunner") -> None:
-        super().__init__(runner)
+    def __init__(self, runner: "EmbeddedRunner", configuration) -> None:
+        super().__init__(runner, configuration)
         self._is_quic = self._configuration.communication_protocol == _QUIC_PROTOCOL
         self._scheme = "quic" if self._is_quic else "tcp"
         self._session = None
         self._subscribers: list = []
+        # Releases serve(). The transport is a mission parameter, so this session
+        # lasts for a mission rather than the process.
+        self._stop = asyncio.Event()
 
     def _build_config(self):
         """Build a Zenoh peer-mode Config. Option A (auto_scout) uses multicast scouting; Option B
@@ -62,9 +65,18 @@ class ZenohBackend(CommunicationBackend):
             return cfg
 
         # Option B: no multicast; connect explicitly to peers listed in node_ip_dict.
+        peers = self._configuration.node_ip_dict
+        if not peers or self._configuration.node_id not in peers:
+            # Backstop behind the load-time 400: reached only if a backend is
+            # built outside the mission path. Raising here fails the bind
+            # handshake instead of leaving a dead serve task.
+            raise RuntimeError(
+                "zenoh without auto_scout requires a node_ip_dict that includes "
+                "this node's own entry to build its listen endpoint."
+            )
         cfg.insert_json5("scouting/multicast/enabled", "false")
         cfg.insert_json5("scouting/gossip/enabled", "true")
-        own_ip = self._configuration.node_ip_dict[self._configuration.node_id].rsplit(":", 1)[0]
+        own_ip = peers[self._configuration.node_id].rsplit(":", 1)[0]
         cfg.insert_json5("listen/endpoints", json.dumps([f"{self._scheme}/{own_ip}:{self._port}"]))
         connect = [
             f"{self._scheme}/{addr}"
@@ -112,8 +124,14 @@ class ZenohBackend(CommunicationBackend):
             f"auto_scout={self._configuration.auto_scout}{cert_note}); "
             f"subscribed to gradys/msg/{node_id} and gradys/msg/broadcast"
         )
-        # Keep the data plane alive for the lifetime of the runner.
-        await asyncio.Future()
+        # zenoh.open and the subscriber declarations above are synchronous and
+        # raise directly, so reaching this point means the session is live.
+        self._signal_ready()
+        # Keep the data plane alive until close(). Rebuilding the session per
+        # mission is also what lets a mission supply a different peer map --
+        # zenoh fixes its connect endpoints when the session opens, so a
+        # long-lived session could never pick one up.
+        await self._stop.wait()
 
     def send(self, dest_node_id: int, payload: dict) -> None:
         self._publish(f"gradys/msg/{dest_node_id}", payload)
@@ -130,5 +148,15 @@ class ZenohBackend(CommunicationBackend):
             self._logger.error(f"Zenoh put to {key!r} failed: {e}")
 
     async def close(self) -> None:
+        self._stop.set()
+        for subscriber in self._subscribers:
+            try:
+                subscriber.undeclare()
+            except Exception as e:
+                # Dropped with the session anyway; never let teardown of one
+                # transport block the next one from binding.
+                self._logger.debug(f"Subscriber undeclare failed: {e}")
+        self._subscribers = []
         if self._session is not None:
             self._session.close()
+            self._session = None

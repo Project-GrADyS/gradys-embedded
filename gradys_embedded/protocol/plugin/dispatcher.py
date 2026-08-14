@@ -214,3 +214,16 @@ def create_dispatcher(protocol: IProtocol) -> ProtocolWrapper:
         _protocol_wrappers[protocol] = ProtocolWrapper(protocol)
 
     return _protocol_wrappers[protocol]
+
+
+def dispose_dispatcher(protocol: IProtocol) -> None:
+    """Forget the wrapper for a protocol instance.
+
+    This registry is keyed by protocol *instance* and is module-global, so
+    without this every finished protocol stays reachable forever. In a
+    long-running service that runs many missions in one process, that is a leak
+    that also keeps each dead protocol's state alive.
+
+    Safe to call for a protocol that was never wrapped.
+    """
+    _protocol_wrappers.pop(protocol, None)

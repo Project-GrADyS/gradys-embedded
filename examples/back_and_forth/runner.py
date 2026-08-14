@@ -1,19 +1,20 @@
+"""Starts the mission service for the back-and-forth example.
+
+Only machine-bound settings live here; the mission itself (protocol, peer map,
+initial position, frame) is loaded over HTTP -- see mission.sh next to this
+file. `protocol:BackAndForthProtocol` resolves without an upload because
+running this script puts its directory on sys.path.
+"""
+
 from gradys_embedded.runner.runner import EmbeddedRunner
 from gradys_embedded.runner.configuration import RunnerConfiguration
-
-from protocol import BackAndForthProtocol
 
 if __name__ == "__main__":
     runner_configuration = RunnerConfiguration(
         node_id=0,
-        node_ip_dict={
-            0: "http://localhost:5000",
-        },
         uav_api_port=8000,
         control_api_port=6000,
-        #origin_gps_coordinates=(-15.840081, -47.926642, -0.016),
-        origin_gps_coordinates=None,  # Use current UAV position as origin
-        initial_position=(0, 0, 2)
+        data_port=5000,
     )
-    runner = EmbeddedRunner(runner_configuration, BackAndForthProtocol)
+    runner = EmbeddedRunner(runner_configuration)
     runner.start_api()

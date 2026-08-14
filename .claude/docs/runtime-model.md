@@ -1,156 +1,143 @@
 # Runtime Model
 
-How `EmbeddedRunner` boots, runs, and shuts down. Source: `gradys_embedded/runner/runner.py`, `gradys_embedded/runner/control_panel.py`.
+How the long-running mission service boots, runs missions, and shuts down. Sources: `gradys_embedded/runner/runner.py` (`EmbeddedRunner`), `gradys_embedded/runner/mission.py` (`MissionManager`), `gradys_embedded/runner/control_panel.py` (control app).
 
 ## The single public entry point
 
 ```python
-runner = EmbeddedRunner(config, MyProtocol)
-runner.start_api()    # blocks; owns the asyncio loop
+runner = EmbeddedRunner(config)   # provisioned RunnerConfiguration only — no protocol class
+runner.start_api()                # blocks; owns the asyncio loop
 ```
 
-`start_api()` is the only public method. It does **not** arm the drone or instantiate the protocol — those happen later, when an external client POSTs to the protocol router.
-
-After `start_api()` returns control to uvicorn, lifecycle is driven over HTTP. The control plane
-and the data plane are **two independent servers** (see below):
+`start_api()` boots the service **idle**. It does not arm the drone, bind the data plane, or instantiate any protocol — there is no default protocol at all. Everything after boot is driven over HTTP against the control plane; the protocol and the data-plane transport arrive with each mission:
 
 ```
-control plane  (control_api_port, always plain HTTP):
-  POST /protocol/setup   → arm + takeoff + go to initial_position
-  POST /protocol/start   → instantiate protocol, initialize, begin telemetry polling
+control plane  (control_api_port, always plain HTTP, bound at boot):
+  /protocols   upload / list / delete protocol modules
+  /mission     load / setup / start / stop / reset / status
+  /runs        list / manifest / file / archive / delete run data
 
-data plane     (node_ip_dict port, transport = communication_protocol):
-  POST /message          → inter-node delivery for http/https/http3 (409 until /protocol/start)
-  (zenoh)                → inter-node delivery via Zenoh pub/sub instead of POST /message
+data plane     (data_port, transport = the mission's communication_protocol,
+                bound at /mission/load — an idle drone listens on nothing else):
+  POST /message   inter-node delivery for http/https/http3 (409 until /mission/start)
+  (zenoh)         inter-node delivery via Zenoh pub/sub instead of POST /message
 ```
 
-## `start_api()` — what it does
+## `start_api()` — what boot does
 
 1. `logging.basicConfig(level=INFO, ...)`.
-2. `self._loop = asyncio.new_event_loop()` and `asyncio.set_event_loop(self._loop)` — the runner owns the loop.
-3. Schedules `self._serve_api()` as a task on that loop.
+2. `self._loop = asyncio.new_event_loop()` — the runner owns the loop.
+3. Schedules `_serve_communication()` as a task (with a done-callback so a boot failure stops the loop instead of dying as an unretrieved task exception).
 4. `self._loop.run_forever()` — blocks until `KeyboardInterrupt`.
-5. `finally`: `encapsulator.finish()` if the protocol was started; close the aiohttp session; close the loop.
+5. `finally`: `_shutdown()` (below).
 
-`_serve_communication()` is the task that boots HTTP:
+`_serve_communication()`:
 
-1. Creates `self._session = aiohttp.ClientSession()` on the runner-owned loop. Every subsequent HTTP call (setup, telemetry, peer sends) reuses this session.
-2. Builds the control app (`create_control_app(self)`, the `/protocol/*` router) and the data-plane backend (`create_backend(self)` from `gradys_embedded.communication`, selected by `communication_protocol`).
-3. Runs **two servers concurrently** via `asyncio.gather`:
-   - **Control plane** — `_serve_control` runs the control app on `control_api_port` over plain HTTP, for every transport.
-   - **Data plane** — `self._backend.serve()`. The `HttpBackend` (http/https/http3) serves its `/message` app on the `node_ip_dict` port via uvicorn/Hypercorn; the `ZenohBackend` (zenoh_tcp/zenoh_quic) opens a Zenoh peer session instead (no uvicorn message server). Both run for the process lifetime. The backend resolves its own bind port from `node_ip_dict[node_id]`.
+1. Creates `self._session = aiohttp.ClientSession()` on the runner-owned loop. Every subsequent HTTP call (setup, telemetry, HTTP peer sends) reuses it.
+2. Creates `self.mission = MissionManager(self)` — the owner of everything per-mission (state machine, run directory, protocol resolution, resource monitor). The runner keeps only process-scoped state.
+3. Starts `_periodic_telemetry()` as a **process-lifetime** task (see below).
+4. Serves the control app (`create_control_app(self)`) on `control_api_port` via uvicorn — the only server at boot. Its per-server signal handlers are disabled; the runner's own `KeyboardInterrupt` path owns shutdown.
 
-To avoid two uvicorn servers racing to install process-wide signal handlers, both the control server and the HTTP backend disable per-server signal handling; the runner's own `KeyboardInterrupt` path owns shutdown (and calls `self._backend.close()`).
+Boot no longer touches `uav_api`: the coordinate frame is a mission parameter and is resolved at load time (`resolve_frame`), so the service comes up even when `uav_api` is not yet running.
 
-Because `_serve_communication` creates the session **before** starting the servers, by the time they bind the session is already attached to the runner. Endpoint handlers can rely on `runner._session` being non-None.
+## The mission state machine
 
-## The control app and the data-plane backend
+`MissionManager` runs one mission at a time:
 
-The `/protocol/*` and `/message` routers used to share one app on one port. The control plane is now
-its own app on `control_api_port` (`control_panel.create_control_app(runner)`), and the data plane is
-owned by a `CommunicationBackend` (`gradys_embedded/communication/`) — for the HTTP transports the
-backend serves the `/message` app (`communication.http.build_message_app(runner)`) on the
-`node_ip_dict` port; for the zenoh transports there is no `/message` app at all. The control router:
-
-### Message app — `POST /message` (HTTP transports only)
-
-Built by `communication.http.build_message_app(runner)` and served by the `HttpBackend`:
-
-```python
-@router.post("/message")
-async def receive_message(payload: MessagePayload):
-    if runner._encapsulator is None:
-        raise HTTPException(409, "Protocol not started")
-    runner._encapsulator.handle_packet(payload.message)
-    return {"status": "ok"}
+```
+IDLE ──load──▶ LOADED ──setup──▶ READY ──start──▶ RUNNING ──stop──▶ RETURNING ──▶ IDLE
+                                                                  (landing detected)
+        any non-IDLE state ──reset──▶ IDLE   (escape hatch; does NOT command the vehicle)
 ```
 
-The 409 guard prevents `AttributeError` if a peer sends a message before this node has finished `/protocol/start`. The zenoh backends have no `/message` app — their subscriber callback applies the same drop-before-start guard. Wire format and full message semantics: `→ .claude/docs/cross-node-communication.md`.
+`setup` and `start` are deliberately separate: fleet coordination needs every drone at its initial position before any protocol begins. Rejected transitions raise `MissionError`, which the control app maps to its HTTP status (409 by default). `GET /mission/status` reports the state, the run id, live `tracked_variables`, and the mission's effective frame/peer-map/transport — echoed so the mission layer can confirm every drone agrees before starting.
 
-### Protocol router — `POST /protocol/setup`, `POST /protocol/start`
+### `POST /mission/load` — validate, bind the data plane, open the run
 
-- `POST /protocol/setup` awaits `runner._goto_initial_position()`. On success, sets `runner._setup_done = True` and returns 200. On any arm/takeoff/goto failure, returns 500 (and `_setup_done` stays False so the operator can retry). Returns 409 if already set up.
-- `POST /protocol/start` awaits `runner._bootstrap_protocol()`. Returns 409 if `/protocol/setup` has not succeeded, or if start has already run. On success returns 200.
+Requires IDLE (409 otherwise). Every fallible step runs **before** anything is created, so a failed load leaves no orphan run directory, stale log handler, or half-set state:
 
-Both endpoints run **on the runner-owned loop** (uvicorn is just a task on that loop), so `await`-ing the runner's helpers does not require any thread-bridging.
+1. **Build and validate the `MissionConfiguration`** from the request body — 400 on an unknown transport, a missing pip extra, `zenoh_quic` without a provisioned certfile, a missing `node_ip_dict` (required unless zenoh + `auto_scout`; zenoh without `auto_scout` also requires the node's own entry), or any dataclass `ValueError`.
+2. **Check disk space** — 507 below `min_free_disk_mb`.
+3. **Resolve the protocol** (`resolve_protocol`): import `module` or `module:ClassName` from `protocols_dir`; 400 on import failure or ambiguity. A cached module is reloaded so a re-uploaded protocol runs its new code.
+4. **Resolve the frame** (`runner.resolve_frame`): fill any omitted `origin_gps_coordinates`/`x_axis_degrees` from this drone's own telemetry, with a loud warning (a fleet relying on this has every drone in a different frame). 502 if `uav_api` is unreachable. Done at load rather than setup so `/mission/status` reports a concrete frame straight away.
+5. **Bind the data plane** (`runner.start_backend(context)`): build the mission transport's `CommunicationBackend` and run `backend.serve()` as a task. `start_backend` then awaits a **readiness handshake** — it races the serve task's death against `backend.wait_ready()` with a 10 s timeout (`BACKEND_START_TIMEOUT`), so a port conflict or bad TLS material fails the load with 500 instead of returning 200 with a dead data plane. A no-op when the running backend already matches the mission's signature (transport + TLS material; zenoh also keys on `auto_scout` + the peer map) — consecutive missions on the same transport reuse the listener; a different transport releases and rebinds the same `data_port`. Binding at load rather than start means every drone is listening before any of them sends: the fleet loads together, then starts together.
+6. **Commit**: create the run directory (`run_<timestamp>[_label]`), attach the per-run log handler, write `RUN_INFO.json` (outcome `"loaded"`), set state LOADED. Disk trouble mid-commit rolls all of it back.
 
-## `_goto_initial_position` — what `/protocol/setup` runs
+### `POST /mission/setup` — arm, take off, fly to position
 
-Three HTTP calls against `http://localhost:<uav_api_port>`, all using the shared `aiohttp.ClientSession`:
+Requires LOADED (409; 400 if the mission was loaded without an `initial_position`). Awaits `runner.goto_initial_position`: three calls against `http://localhost:<uav_api_port>` —
 
-1. `GET /command/arm` — arms the flight controller. Any non-200 logs fatal and returns False.
-2. `GET /command/takeoff?alt=<initial_position[2]>` — takes off to the configured altitude.
-3. `POST /movement/go_to_gps_wait` — converts `initial_position` (cartesian NEU, meters) to GPS via `cartesian_to_geo(origin_gps_coordinates, initial_position)` and **waits for the drone to arrive** before returning.
+1. `GET /command/arm`
+2. `GET /command/takeoff?alt=<initial_position[2]>`
+3. `POST /movement/go_to_gps_wait` with `cartesian_to_geo(origin, initial_position, x_axis_degrees)` — **blocks until arrival**.
 
-Returns True if all three succeed.
+Any non-200 aborts with 500 and the state stays LOADED, so setup is retryable. On success: READY.
 
-## `_bootstrap_protocol` — what `/protocol/start` runs
+### `POST /mission/start` — run the protocol
 
-```python
-async def _bootstrap_protocol(self):
-    self._encapsulator = EmbeddedEncapsulator(config, self._loop, self._session, backend=self._backend)
-    self._encapsulator.encapsulate(self._protocol_class)  # instantiate protocol
-    self._encapsulator.initialize()                        # call protocol.initialize()
+Requires READY (409). Starts the resource monitor, then `runner.bootstrap_protocol`: builds an `EmbeddedEncapsulator` around the mission context and the already-bound backend, instantiates the protocol, binds it as `runner._encapsulator`, and calls `protocol.initialize()`. State: RUNNING.
 
-    self._loop.create_task(self._periodic_telemetry())
-```
+The backend is untouched here — **both transports read `runner._encapsulator` per delivery, so rebinding it re-routes inbound messages atomically without rebinding any port** (this is the swap seam that lets protocols change between missions without restarting the process).
 
-The encapsulator receives `self._backend` (the `CommunicationBackend` built in `_serve_communication`), and the provider delegates SEND/BROADCAST to it. For the zenoh transports, `backend.serve()` (which runs from `start_api`, before `/protocol/start`) has already opened the shared peer session that `backend.send`/`broadcast` publish on; its subscriber callback, like the `/message` 409 guard, drops inbound samples while `self._encapsulator is None` (before start).
+### `POST /mission/stop` — finish, flush, RTL
 
-The protocol's `initialize` runs **before** the telemetry loop is started. The data plane has been bound since `start_api` started the backend — the `/message` endpoint (HTTP transports) just rejected with 409, and the zenoh subscriber just dropped samples, until `_bootstrap_protocol` populated `self._encapsulator`.
+Allowed from RUNNING, READY, or LOADED. Order matters:
 
-Practical consequence: messages broadcast from `initialize` will reach peers whose own `/protocol/start` has already run, but will be rejected by peers still in the setup phase. Boot ordering across drones is uncoordinated — design protocols to tolerate dropped bootstrap broadcasts, or delay the first broadcast with a short timer.
+1. `runner.teardown_protocol()` — `encapsulator.finish()` runs the protocol's `finish()` (data flush) and gates the provider off, so a stopped protocol cannot fight the return or command a disarmed vehicle. `runner._encapsulator` becomes `None` again (inbound messages go back to 409/drop).
+2. Stop the resource monitor.
+3. If the vehicle was flying (RUNNING/READY): `request_return_to_launch()` **fire-and-forget** — `/command/rtl` blocks until home *and* disarmed (~250 s), so stop returns while the drone is still descending. State: RETURNING. Otherwise (LOADED): straight to IDLE, run finalized.
+
+RETURNING → IDLE is decided locally by the telemetry loop: when `relative_alt <= telemetry_landed_alt`, `mission.note_landed()` finalizes the run with outcome `"completed"`.
+
+### `POST /mission/reset` — the escape hatch
+
+Allowed from any non-IDLE state (409 when idle). Forces the state machine back to IDLE: tears down the protocol if one is live, finalizes the run with outcome `"reset"`, and **does NOT command the vehicle** — an RTL already issued keeps flying; an airborne vehicle stays airborne. Exists because the only ordinary exit from RETURNING is the telemetry loop's landing detection, and a broken poll must not strand the service until a field power-cycle.
+
+## The inbound-message guard
+
+The `/message` route (HTTP transports) rejects with 409, and the zenoh subscriber callback drops the sample, while `runner._encapsulator is None` — i.e. any time before `/mission/start` and after stop/reset. The data plane itself only exists from `/mission/load` onward; before a load there is nothing bound on `data_port` at all, so a peer's send fails at the connection level instead.
+
+Practical consequence: messages broadcast from `initialize` reach peers that have already started, and are dropped by peers still in setup. Start ordering across drones is uncoordinated — design protocols to tolerate dropped bootstrap broadcasts, or delay the first broadcast with a short timer.
 
 ## Telemetry loop — `_periodic_telemetry`
 
-Infinite coroutine started by `_bootstrap_protocol`:
+Process-lifetime, started at boot — not per mission. Each tick re-reads the active mission context, so it follows a load/swap on its own:
 
-```python
-while True:
-    try:
-        async with session.get(f"{base_url}/telemetry/gps") as resp:
-            data = await resp.json()
-        pos = data["info"]["position"]
-        geo = (pos["lat"], pos["lon"], pos["relative_alt"])
-        cartesian = geo_to_cartesian(origin_gps_coordinates, geo)
-        encapsulator.handle_telemetry(Telemetry(current_position=cartesian))
-    except Exception as e:
-        self._logger.error(f"Telemetry fetch failed: {e}")
-    await asyncio.sleep(interval)
-```
+- **Idle** (no mission): polls at `EmbeddedRunner.IDLE_TELEMETRY_INTERVAL` (0.5 s), performs **no frame conversion** and delivers nothing to any protocol — it is the uav_api health signal and the landing detector.
+- **During a mission**: polls at the mission's `telemetry_interval`, converts `(lat, lon, relative_alt)` with the **mission's** frame (`geo_to_cartesian(origin, geo, x_axis_degrees)`), and calls `encapsulator.handle_telemetry(...)` when a protocol is live.
+- Every tick also runs `_check_for_landing`, which flips a RETURNING mission to IDLE once `relative_alt <= telemetry_landed_alt`.
 
 Key points:
 
-- **The altitude used is `relative_alt`** (meters above takeoff), not absolute altitude. Protocols see z relative to the drone's home point, which aligns with the cartesian NEU frame.
-- **A failed telemetry fetch is swallowed.** The loop retries at the next interval; the protocol receives no explicit signal that telemetry dropped. Detect stalls by timestamping telemetry inside the protocol if you care.
-- **`handle_telemetry` is called from the asyncio loop.** If the protocol blocks inside this hook, the next telemetry and every other loop task pile up.
+- **The altitude used is `relative_alt`** (meters above takeoff), aligning z with the cartesian frame.
+- **A failed fetch is swallowed** and retried next interval; the protocol gets no explicit stall signal.
+- **`handle_telemetry` runs on the asyncio loop** — blocking inside it piles up everything else.
 
-Conversion details and the NEU convention: `→ .claude/docs/mobility-and-telemetry.md`.
+Conversion details: `→ .claude/docs/mobility-and-telemetry.md`.
 
 ## Shutdown
 
-The runner's `finally` block in `start_api()`:
+`start_api()`'s `finally` block runs `_shutdown()`:
 
-1. Calls `encapsulator.finish()` if a protocol was started — the protocol's `finish()` runs. The loop is about to close, so `finish()` cannot rely on async operations or peer HTTP calls resolving.
-2. Closes the aiohttp session (`run_until_complete(session.close())`).
-3. Closes the event loop.
+1. `mission.shutdown()` — tears down any live protocol (its `finish()` runs, data flushes), writes outcome `"interrupted"` if a mission was in progress, detaches the run log. Deliberately does **not** command the vehicle: a process shutdown is not a mission stop.
+2. Cancels the telemetry task.
+3. `stop_backend()` — asks the data plane to close so the listener is released in an orderly way (not just cancelled), with a 5 s timeout (`BACKEND_STOP_TIMEOUT`) so a wedged transport cannot hang shutdown.
+4. Cancels remaining tasks, closes the aiohttp session, closes the loop.
 
-**Do not issue outbound communication commands from `finish()`** — they schedule aiohttp tasks on a loop that is closing.
-
-`KeyboardInterrupt` (Ctrl-C) is the intended shutdown path. SIGTERM reaches the same `finally` because `run_forever()` raises on signal.
+**Do not issue outbound communication commands from `finish()`** — they schedule tasks on a loop that is closing. `KeyboardInterrupt` (Ctrl-C) is the intended shutdown path.
 
 ## Threading / concurrency model summary
 
-- **One process per drone.**
-- **One asyncio loop** owned by `EmbeddedRunner`. Two servers (control + data plane) run cooperatively on it.
-- **No threads for HTTP.** `uvicorn.Server` runs cooperatively on the same loop (`loop="asyncio"`).
-- **Exception: Zenoh.** Its subscriber callback fires on a Zenoh-owned background thread; the callback only marshals onto the loop via `self._loop.call_soon_threadsafe(self._encapsulator.handle_packet, message)` — it must never touch protocol/loop state directly.
-- **Blocking inside any `handle_*` hook freezes everything** — including the `/protocol` and `/message` endpoints.
+- **One process per drone**, one asyncio loop owned by `EmbeddedRunner`.
+- **Control plane always; data plane per mission.** Both servers run cooperatively on the same loop (uvicorn/Hypercorn with `loop="asyncio"`, per-server signal handlers disabled); no threads for HTTP.
+- **`MissionManager` owns per-mission state**, the runner owns process state — the split is what makes protocol swap-without-restart possible.
+- **Exception: Zenoh.** Its subscriber callback fires on a Zenoh-owned background thread and only marshals onto the loop via `call_soon_threadsafe` — it must never touch protocol/loop state directly.
+- **Blocking inside any `handle_*` hook freezes everything** — the control endpoints, `/message`, and the telemetry loop included.
 
 ## Related docs
 
-- `→ .claude/docs/configuration.md` — what `RunnerConfiguration` fields control and their invariants.
-- `→ .claude/docs/encapsulator-interface.md` — how `EmbeddedEncapsulator` and `EmbeddedProvider` translate calls once the loop is running.
+- `→ .claude/docs/configuration.md` — the provisioned/mission config split and every field's semantics.
+- `→ .claude/docs/encapsulator-interface.md` — how `EmbeddedEncapsulator` and `EmbeddedProvider` translate calls once a protocol runs.
 - `→ .claude/docs/protocol-interface.md` — how the five `IProtocol` hooks are invoked from this loop.
 - `→ .claude/docs/mobility-and-telemetry.md` — coordinate frames and the telemetry fetch path.
-- `→ .claude/docs/cross-node-communication.md` — the `/message` router and peer HTTP.
+- `→ .claude/docs/cross-node-communication.md` — the data-plane transports and peer messaging.

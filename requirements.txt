@@ -1,4 +1,14 @@
+# Pinned set for reproducible installs. The authoritative dependency list is
+# pyproject.toml -- keep this in step with it.
+#
+# Optional extras are not pinned here; install them explicitly when needed:
+#   pip install "gradys-embedded[http3]"    hypercorn[h3], niquests
+#   pip install "gradys-embedded[zenoh]"    eclipse-zenoh
+
 fastapi==0.115.4
 uvicorn==0.32.0
 aiohttp==3.9.0
 pydantic==2.12.5
+python-multipart==0.0.32
+cryptography==44.0.0
+pandas==2.2.3

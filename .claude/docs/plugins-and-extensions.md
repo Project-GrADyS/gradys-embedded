@@ -2,7 +2,7 @@
 
 Source: `gradys_embedded/protocol/plugin/`. The dispatcher pattern and the built-in plugins mirror `gradys-sim-nextgen` almost line-for-line — intentional, so the same plugin-using protocol runs in both environments without change.
 
-**Extensions (`gradysim.simulator.extension.*` — Radio, Camera) do not exist in gradys-embedded.** They are simulator-only helpers that read `PythonProvider` directly. Under `EmbeddedProvider` they would silently no-op — see `→ /home/fleury/gradys/major_projects/gradys-sim-nextgen/.claude/docs/plugins-and-extensions.md` which covers the extension no-op behavior. If a protocol instantiates `Radio(self)` or `Camera(self)` and runs here, the extension's methods will produce no effect on hardware.
+**Extensions (`gradysim.simulator.extension.*` — Radio, Camera) do not exist in gradys-embedded.** They are simulator-only helpers that read `PythonProvider` directly. Under `EmbeddedProvider` they would silently no-op — see `→ https://github.com/Project-GrADyS/gradys-sim-nextgen/blob/main/.claude/docs/plugins-and-extensions.md` which covers the extension no-op behavior. If a protocol instantiates `Radio(self)` or `Camera(self)` and runs here, the extension's methods will produce no effect on hardware.
 
 ## The dispatcher
 
@@ -98,4 +98,4 @@ Embedded-specific rules on top of the simulator's:
 - `→ .claude/docs/mobility-and-telemetry.md` — where mission/random/follow plugins' commands ultimately land.
 - `→ .claude/docs/cross-node-communication.md` — the HTTP that leader broadcasts and Raft messages travel over.
 - `→ .claude/docs/encapsulator-interface.md` — timer-scheduling quirks plugins must respect.
-- `→ /home/fleury/gradys/major_projects/gradys-sim-nextgen/.claude/docs/plugins-and-extensions.md` — the same plugin set in the simulator, plus Extensions (Radio, Camera) that do not apply here.
+- `→ https://github.com/Project-GrADyS/gradys-sim-nextgen/blob/main/.claude/docs/plugins-and-extensions.md` — the same plugin set in the simulator, plus Extensions (Radio, Camera) that do not apply here.

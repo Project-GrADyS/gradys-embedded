@@ -1,0 +1,78 @@
+# Example gradys-embedded runner configuration.
+#
+# Canonical example; fleet deployments render this from a template in
+# gradys-fleet (roles/gradys_embedded/templates/embedded.toml.j2).
+#
+# Install to /etc/gradys/embedded.toml and run:
+#     gradys-embedded --config /etc/gradys/embedded.toml
+
+# Only provisioned, machine-bound settings live here. Everything describing an
+# experiment -- the protocol, the peer map (node_ip_dict), the coordinate frame
+# (origin_gps_coordinates, x_axis_degrees), initial_position, the transport
+# (communication_protocol, auto_scout) and telemetry_interval -- is supplied per
+# mission in POST /mission/load and is REJECTED by this loader.
+
+# --- Identity (differs per drone) --------------------------------------------
+
+# Must match the mission layer's inventory (the node ids used in each mission's
+# node_ip_dict). By fleet convention this equals the uav_api sysid and the
+# flight controller's SYSID_THISMAV, though nothing in the software enforces
+# that.
+node_id = 1
+
+# --- Local services ----------------------------------------------------------
+
+# uav_api is always reached over plain HTTP on localhost at this port.
+uav_api_port = 8000
+
+# Control plane: the /mission, /protocols and /runs endpoints land here.
+control_api_port = 6000
+
+# Port this node binds for the inter-node data plane. Which transport serves it
+# (http/https/http3/zenoh_tcp/zenoh_quic) is chosen per mission at
+# POST /mission/load; the port itself belongs to the machine.
+data_port = 5000
+
+# --- Run data ----------------------------------------------------------------
+
+# One subdirectory per mission, holding that run's statistics CSVs,
+# resource_usage.csv, runner.log and RUN_INFO.json. Served by GET /runs and the
+# download endpoints, so this must be writable and on persistent storage.
+runs_dir = "~/gradys_runs"
+
+# Where POST /protocols/upload writes, and what is added to sys.path so uploaded
+# protocols can be imported by module name.
+protocols_dir = "~/gradys_protocols"
+
+# Refuse to open a new run below this many megabytes free. Nothing is ever
+# auto-deleted -- losing an uncollected flight to a prune is worse than a
+# refused start. Set 0 to disable.
+min_free_disk_mb = 200
+
+# --- TLS (optional) ----------------------------------------------------------
+#
+# Fleet-wide certificate pair, identical on every drone. Used by the https and
+# http3 transports, and REQUIRED before a mission may choose zenoh_quic (load
+# rejects it otherwise). Leave unset to serve https/http3 with an ephemeral
+# self-signed certificate.
+#
+# certfile = "/etc/gradys/fleet-cert.pem"
+# keyfile  = "/etc/gradys/fleet-key.pem"
+
+# --- Where the mission parameters went ---------------------------------------
+#
+# A mission is loaded over HTTP; that request carries everything experiment-
+# scoped. For example:
+#
+#   curl -X POST http://<drone>:6000/mission/load -H 'Content-Type: application/json' -d '{
+#     "protocol": "my_protocol:MyProtocol",
+#     "node_ip_dict": {"1": "10.0.2.11:5000", "2": "10.0.2.12:5000"},
+#     "initial_position": [0.0, 0.0, 10.0],
+#     "origin_gps_coordinates": [-15.840081, -47.926642, 0.016],
+#     "x_axis_degrees": 0.0,
+#     "communication_protocol": "http"
+#   }'
+#
+# node_ip_dict values are bare "host:port" with NO scheme, identical on every
+# node; the frame must also be identical fleet-wide. /mission/status echoes them
+# so the mission layer can verify agreement before starting.

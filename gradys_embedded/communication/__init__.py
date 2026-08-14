@@ -17,14 +17,48 @@ if TYPE_CHECKING:
 __all__ = ["CommunicationBackend", "create_backend"]
 
 
-def create_backend(runner: "EmbeddedRunner") -> CommunicationBackend:
-    protocol = runner._configuration.communication_protocol
-    if protocol in ("http", "https", "http3"):
+HTTP_PROTOCOLS = ("http", "https", "http3")
+ZENOH_PROTOCOLS = ("zenoh_tcp", "zenoh_quic")
+PROTOCOLS = HTTP_PROTOCOLS + ZENOH_PROTOCOLS
+
+# Which optional extra each protocol needs, for a clear error at mission load
+# rather than an ImportError inside a serve task nobody is awaiting.
+PROTOCOL_EXTRAS = {
+    "http3": ("hypercorn", 'gradys-embedded[http3]'),
+    "zenoh_tcp": ("zenoh", 'gradys-embedded[zenoh]'),
+    "zenoh_quic": ("zenoh", 'gradys-embedded[zenoh]'),
+}
+
+
+def missing_extra(protocol: str) -> str | None:
+    """Return the pip extra a protocol needs but does not have installed.
+
+    Checked without importing the module, so the lazy-import design is preserved:
+    nothing heavyweight is loaded unless the protocol is actually selected.
+    """
+    requirement = PROTOCOL_EXTRAS.get(protocol)
+    if requirement is None:
+        return None
+
+    import importlib.util
+
+    module, extra = requirement
+    return None if importlib.util.find_spec(module) is not None else extra
+
+
+def create_backend(runner: "EmbeddedRunner", configuration) -> CommunicationBackend:
+    """Build the backend for a mission context's transport.
+
+    `configuration` is the mission's :class:`MissionContext` -- the transport
+    and the peer map are mission-scoped, so there is no provisioned fallback.
+    """
+    protocol = configuration.communication_protocol
+    if protocol in HTTP_PROTOCOLS:
         from gradys_embedded.communication.http import HttpBackend
 
-        return HttpBackend(runner)
-    if protocol in ("zenoh_tcp", "zenoh_quic"):
+        return HttpBackend(runner, configuration)
+    if protocol in ZENOH_PROTOCOLS:
         from gradys_embedded.communication.zenoh import ZenohBackend
 
-        return ZenohBackend(runner)
+        return ZenohBackend(runner, configuration)
     raise ValueError(f"Invalid communication_protocol {protocol!r}")
