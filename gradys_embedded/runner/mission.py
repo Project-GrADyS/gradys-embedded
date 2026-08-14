@@ -323,8 +323,10 @@ class MissionManager:
                 f"Cannot load a mission while {self.state.value}; stop the current mission first"
             )
 
-        # Validated before anything is created, so a rejected transport or a
-        # missing peer map does not leave an orphan run directory behind.
+        # Everything that can fail runs before anything is created, working on
+        # locals: a rejected transport, an unreachable uav_api or a port that
+        # will not bind must not leave an orphan run directory, a stale log
+        # handler or half-set mission state behind a load that reported failure.
         mission_configuration = self._build_mission_configuration(
             initial_position=initial_position,
             origin_gps_coordinates=origin_gps_coordinates,
@@ -339,6 +341,33 @@ class MissionManager:
 
         protocol_class = self.resolve_protocol(protocol)
 
+        context = MissionContext(self._configuration, mission_configuration)
+
+        # Resolved here rather than at setup so `/mission/status` reports a
+        # concrete frame straight away. That is what lets the mission layer spot
+        # a drone that fell back to its own GPS -- and therefore disagrees with
+        # the rest of the fleet -- before anything takes off.
+        try:
+            context = await self._runner.resolve_frame(context)
+        except Exception as exc:
+            raise MissionError(
+                f"Could not resolve the mission frame from uav_api: {exc!r}",
+                status_code=502,
+            ) from exc
+
+        # Bind the data plane for this mission's transport. Done at load rather
+        # than start so every drone is listening before any of them begins
+        # sending -- the fleet loads together, then starts together.
+        # start_backend returns only once the listener is actually ready, so a
+        # bind failure fails the load here instead of a task nobody awaits.
+        try:
+            await self._runner.start_backend(context)
+        except Exception as exc:
+            raise MissionError(
+                f"Data plane failed to start: {exc}", status_code=500
+            ) from exc
+
+        # Commit point: only now touch disk and self.
         run_id = "run_" + datetime.now().strftime("%Y%m%d_%H%M%S")
         if label:
             run_id += "_" + _safe_component(label)
@@ -350,28 +379,29 @@ class MissionManager:
             suffix += 1
             run_dir = self.runs_dir / f"{run_id}_{suffix}"
         run_id = run_dir.name
-        run_dir.mkdir(parents=True)
 
-        self._protocol_class = protocol_class
-        self.protocol_spec = protocol
-        self.run_id = run_id
-        self._run_dir = run_dir
-        self._context = MissionContext(self._configuration, mission_configuration)
+        try:
+            run_dir.mkdir(parents=True)
+            self._protocol_class = protocol_class
+            self.protocol_spec = protocol
+            self.run_id = run_id
+            self._run_dir = run_dir
+            self._context = context
+            self._attach_run_log(run_dir)
+            self._write_run_info(outcome="loaded")
+        except Exception:
+            # Disk trouble mid-commit: put the manager back the way it was
+            # rather than half-loaded. The backend stays up; the next load
+            # reuses or replaces it.
+            self._detach_run_log()
+            self._protocol_class = None
+            self.protocol_spec = None
+            self.run_id = None
+            self._run_dir = None
+            self._context = None
+            shutil.rmtree(run_dir, ignore_errors=True)
+            raise
 
-        self._attach_run_log(run_dir)
-
-        # Resolved here rather than at setup so `/mission/status` reports a
-        # concrete frame straight away. That is what lets the mission layer spot
-        # a drone that fell back to its own GPS -- and therefore disagrees with
-        # the rest of the fleet -- before anything takes off.
-        self._context = await self._runner.resolve_frame(self._context)
-
-        # Bind the data plane for this mission's transport. Done at load rather
-        # than start so every drone is listening before any of them begins
-        # sending -- the fleet loads together, then starts together.
-        await self._runner.start_backend(self._context)
-
-        self._write_run_info(outcome="loaded")
         self.state = MissionState.LOADED
         self._logger.info(f"Loaded mission {run_id} with protocol {protocol}")
         return self.status()
