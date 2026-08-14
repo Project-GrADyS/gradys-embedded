@@ -54,7 +54,7 @@ def build_message_app(runner: "EmbeddedRunner") -> FastAPI:
 class HttpBackend(CommunicationBackend):
     """Serves ``/message`` over HTTP/HTTPS/HTTP3 and sends to peers over the matching scheme."""
 
-    def __init__(self, runner: "EmbeddedRunner", configuration=None) -> None:
+    def __init__(self, runner: "EmbeddedRunner", configuration) -> None:
         super().__init__(runner, configuration)
         self._protocol = self._configuration.communication_protocol
         self._app = build_message_app(runner)
@@ -136,14 +136,24 @@ class HttpBackend(CommunicationBackend):
                 ready_timer.cancel()
 
     def send(self, dest_node_id: int, payload: dict) -> None:
-        dest_addr = self._configuration.node_ip_dict.get(dest_node_id)
+        # Load-time validation makes a missing map unreachable; guarded anyway
+        # because dropping a send beats crashing a flying protocol.
+        peers = self._configuration.node_ip_dict
+        if not peers:
+            self._logger.warning(f"No peer map for this mission; dropping send to node {dest_node_id}")
+            return
+        dest_addr = peers.get(dest_node_id)
         if dest_addr is None:
             self._logger.warning(f"Unknown destination node {dest_node_id}")
             return
         self._fire_and_forget(self._send_to_peer(dest_addr, payload))
 
     def broadcast(self, payload: dict) -> None:
-        for nid, addr in self._configuration.node_ip_dict.items():
+        peers = self._configuration.node_ip_dict
+        if not peers:
+            self._logger.warning("No peer map for this mission; dropping broadcast")
+            return
+        for nid, addr in peers.items():
             if nid != self._configuration.node_id:
                 self._fire_and_forget(self._send_to_peer(addr, payload))
 

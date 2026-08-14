@@ -27,17 +27,16 @@ import logging
 import shutil
 import sys
 import time
-from dataclasses import replace
 from datetime import datetime, timezone
 from enum import Enum
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Optional, Type
 
-from gradys_embedded.communication import PROTOCOLS, missing_extra
+from gradys_embedded.communication import PROTOCOLS, ZENOH_PROTOCOLS, missing_extra
 from gradys_embedded.protocol.interface import IProtocol
+from gradys_embedded.runner.configuration import MissionConfiguration, MissionContext
 
 if TYPE_CHECKING:
-    from gradys_embedded.runner.configuration import RunnerConfiguration
     from gradys_embedded.runner.runner import EmbeddedRunner
 
 
@@ -84,7 +83,7 @@ class MissionManager:
 
         self._protocol_class: Optional[Type[IProtocol]] = None
         self._run_dir: Optional[Path] = None
-        self._mission_config = self._configuration
+        self._context: Optional[MissionContext] = None
         self._monitor = None
         self._log_handler: Optional[logging.Handler] = None
         self._started_at: Optional[float] = None
@@ -113,20 +112,15 @@ class MissionManager:
         if self._started_at is not None:
             elapsed = round(time.time() - self._started_at, 3)
 
-        config = self._mission_config
-        return {
-            "state": self.state.value,
-            "node_id": self._configuration.node_id,
-            "run_id": self.run_id,
-            "protocol": self.protocol_spec,
-            "elapsed_seconds": elapsed,
-            "tracked_variables": tracked,
-            # Echoed so the mission layer can confirm every drone agrees BEFORE
-            # starting. The fleet used to guarantee this structurally, by
-            # generating identical configs from one inventory; now it is the
-            # caller's job, and this is what makes divergence checkable rather
-            # than something you discover in the flight data afterwards.
-            "frame": {
+        # Echoed so the mission layer can confirm every drone agrees BEFORE
+        # starting. The fleet used to guarantee this structurally, by
+        # generating identical configs from one inventory; now it is the
+        # caller's job, and this is what makes divergence checkable rather
+        # than something you discover in the flight data afterwards.
+        frame = None
+        if self._context is not None:
+            config = self._context
+            frame = {
                 "origin_gps_coordinates": list(config.origin_gps_coordinates)
                 if config.origin_gps_coordinates else None,
                 "x_axis_degrees": config.x_axis_degrees,
@@ -135,7 +129,16 @@ class MissionManager:
                 "node_ip_dict": dict(config.node_ip_dict) if config.node_ip_dict else None,
                 "communication_protocol": config.communication_protocol,
                 "auto_scout": config.auto_scout,
-            },
+            }
+
+        return {
+            "state": self.state.value,
+            "node_id": self._configuration.node_id,
+            "run_id": self.run_id,
+            "protocol": self.protocol_spec,
+            "elapsed_seconds": elapsed,
+            "tracked_variables": tracked,
+            "frame": frame,
         }
 
     # ------------------------------------------------------------- protocols
@@ -259,65 +262,57 @@ class MissionManager:
                 status_code=400,
             )
 
-    def _build_mission_config(self, initial_position=None, origin_gps_coordinates=None,
-                              x_axis_degrees=None, node_ip_dict=None,
-                              communication_protocol=None, auto_scout=None) -> "RunnerConfiguration":
-        """Overlay this run's parameters onto the provisioned configuration.
+    def _build_mission_configuration(self, **params) -> MissionConfiguration:
+        """Turn a load request's parameters into a validated MissionConfiguration.
 
-        Anything not supplied keeps whatever was provisioned, so a drone that is
-        still configured the old way behaves exactly as before.
+        Omitted (None) parameters take the dataclass defaults -- there is no
+        provisioned value to fall back to; the mission API is the only gateway
+        for these. Value errors become 400s.
         """
-        overrides: dict[str, Any] = {}
+        supplied = {name: value for name, value in params.items() if value is not None}
+        try:
+            mission = MissionConfiguration(**supplied)
+        except ValueError as exc:
+            raise MissionError(str(exc), status_code=400) from exc
 
-        if initial_position is not None:
-            overrides["initial_position"] = tuple(initial_position)
-        if origin_gps_coordinates is not None:
-            overrides["origin_gps_coordinates"] = tuple(origin_gps_coordinates)
-        if x_axis_degrees is not None:
-            overrides["x_axis_degrees"] = float(x_axis_degrees)
+        self._validate_transport(mission.communication_protocol)
 
-        if node_ip_dict is not None:
-            peers = {int(k): str(v) for k, v in node_ip_dict.items()}
-            for node, address in peers.items():
-                # Same trap the config loader guards: the transport builds
-                # f"http://{addr}/message" itself, so a scheme here yields
-                # "http://http://..." and every send fails silently.
-                if "://" in address:
-                    raise MissionError(
-                        f"node_ip_dict[{node}] = {address!r} must not include a scheme; "
-                        f"use the bare form \"host:port\".",
-                        status_code=400,
-                    )
+        needs_peer_map = not (
+            mission.communication_protocol in ZENOH_PROTOCOLS and mission.auto_scout
+        )
+        if needs_peer_map and not mission.node_ip_dict:
+            raise MissionError(
+                "node_ip_dict is required: supply the peer map in POST /mission/load. "
+                "(Only a zenoh transport with auto_scout=true can discover peers "
+                "without one.)",
+                status_code=400,
+            )
+        if (mission.communication_protocol in ZENOH_PROTOCOLS and not mission.auto_scout
+                and self._configuration.node_id not in mission.node_ip_dict):
+            raise MissionError(
+                f"node_ip_dict must include this node ({self._configuration.node_id}): "
+                f"zenoh without auto_scout builds its listen endpoint from the node's "
+                f"own entry.",
+                status_code=400,
+            )
 
-            # No zenoh restriction here any more. The session is opened per
-            # mission, so its connect endpoints are built from whatever map this
-            # mission supplied -- the reason the old guard existed is gone.
-            overrides["node_ip_dict"] = peers
-
-        if communication_protocol is not None:
-            self._validate_transport(communication_protocol)
-            overrides["communication_protocol"] = communication_protocol
-        if auto_scout is not None:
-            overrides["auto_scout"] = bool(auto_scout)
-
-        if not overrides:
-            return self._configuration
-        return replace(self._configuration, **overrides)
+        return mission
 
     @property
-    def mission_config(self) -> "RunnerConfiguration":
-        """The configuration in force: the mission's overlay, or what was provisioned."""
-        return self._mission_config
+    def context(self) -> Optional[MissionContext]:
+        """The loaded mission's effective configuration, or None while idle."""
+        return self._context
 
     async def load(self, protocol: str, initial_position=None, label: Optional[str] = None,
                    origin_gps_coordinates=None, x_axis_degrees=None, node_ip_dict=None,
-                   communication_protocol=None, auto_scout=None) -> dict:
+                   communication_protocol=None, auto_scout=None,
+                   telemetry_interval=None) -> dict:
         """Open a run and select the protocol to fly.
 
         The coordinate frame (`origin_gps_coordinates`, `x_axis_degrees`), the peer
-        map and the transport are mission-scoped: they describe an experiment
-        rather than a machine, so the mission layer supplies them per run.
-        Anything omitted falls back to whatever was provisioned.
+        map, the transport and the poll rate are mission-scoped: they describe an
+        experiment rather than a machine, and this is their only gateway --
+        nothing here falls back to a provisioned value.
 
         Loading also binds the data plane for the chosen transport — only the
         chosen one is ever served — reusing the running listener when the
@@ -328,10 +323,17 @@ class MissionManager:
                 f"Cannot load a mission while {self.state.value}; stop the current mission first"
             )
 
-        # Validated before anything is created, so a rejected transport does not
-        # leave an orphan run directory behind.
-        if communication_protocol is not None:
-            self._validate_transport(communication_protocol)
+        # Validated before anything is created, so a rejected transport or a
+        # missing peer map does not leave an orphan run directory behind.
+        mission_configuration = self._build_mission_configuration(
+            initial_position=initial_position,
+            origin_gps_coordinates=origin_gps_coordinates,
+            x_axis_degrees=x_axis_degrees,
+            node_ip_dict=node_ip_dict,
+            communication_protocol=communication_protocol,
+            auto_scout=auto_scout,
+            telemetry_interval=telemetry_interval,
+        )
 
         self._check_disk_space()
 
@@ -354,14 +356,7 @@ class MissionManager:
         self.protocol_spec = protocol
         self.run_id = run_id
         self._run_dir = run_dir
-        self._mission_config = self._build_mission_config(
-            initial_position=initial_position,
-            origin_gps_coordinates=origin_gps_coordinates,
-            x_axis_degrees=x_axis_degrees,
-            node_ip_dict=node_ip_dict,
-            communication_protocol=communication_protocol,
-            auto_scout=auto_scout,
-        )
+        self._context = MissionContext(self._configuration, mission_configuration)
 
         self._attach_run_log(run_dir)
 
@@ -369,12 +364,12 @@ class MissionManager:
         # concrete frame straight away. That is what lets the mission layer spot
         # a drone that fell back to its own GPS -- and therefore disagrees with
         # the rest of the fleet -- before anything takes off.
-        self._mission_config = await self._runner.resolve_frame(self._mission_config)
+        self._context = await self._runner.resolve_frame(self._context)
 
         # Bind the data plane for this mission's transport. Done at load rather
         # than start so every drone is listening before any of them begins
         # sending -- the fleet loads together, then starts together.
-        await self._runner.start_backend(self._mission_config)
+        await self._runner.start_backend(self._context)
 
         self._write_run_info(outcome="loaded")
         self.state = MissionState.LOADED
@@ -387,16 +382,15 @@ class MissionManager:
         if self.state is not MissionState.LOADED:
             raise MissionError(f"Cannot set up while {self.state.value}; load a mission first")
 
-        if self._mission_config.initial_position is None:
-            # It is no longer provisioned, so a mission that omits it has nowhere
-            # to fly. Caught here rather than as a TypeError mid-takeoff.
+        if self._context.initial_position is None:
+            # A mission that omits it has nowhere to fly. Caught here rather
+            # than as a TypeError mid-takeoff.
             raise MissionError(
-                "No initial_position for this mission. Supply it in POST /mission/load, "
-                "or provision a default.",
+                "No initial_position for this mission. Supply it in POST /mission/load.",
                 status_code=400,
             )
 
-        ok = await self._runner.goto_initial_position(self._mission_config)
+        ok = await self._runner.goto_initial_position(self._context)
         if not ok:
             raise MissionError("Setup failed; check logs", status_code=500)
 
@@ -412,7 +406,7 @@ class MissionManager:
 
         self._start_resource_monitor()
         self._started_at = time.time()
-        await self._runner.bootstrap_protocol(self._protocol_class, self._mission_config)
+        await self._runner.bootstrap_protocol(self._protocol_class, self._context)
 
         self.state = MissionState.RUNNING
         self._write_run_info(outcome="running")
@@ -587,9 +581,9 @@ class MissionManager:
             self._log_handler = None
 
     def _write_run_info(self, outcome: str) -> None:
-        if self._run_dir is None:
+        if self._run_dir is None or self._context is None:
             return
-        config = self._mission_config
+        config = self._context
         payload = {
             "run_id": self.run_id,
             "node_id": config.node_id,
@@ -623,6 +617,6 @@ class MissionManager:
         self._detach_run_log()
         self._protocol_class = None
         self._run_dir = None
-        self._mission_config = self._configuration
+        self._context = None
         # run_id and protocol_spec are kept so status() still reports what was
         # last flown after the vehicle has landed.

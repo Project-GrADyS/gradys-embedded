@@ -46,13 +46,12 @@ def missing_extra(protocol: str) -> str | None:
     return None if importlib.util.find_spec(module) is not None else extra
 
 
-def create_backend(runner: "EmbeddedRunner", configuration=None) -> CommunicationBackend:
-    """Build the backend for a configuration's transport.
+def create_backend(runner: "EmbeddedRunner", configuration) -> CommunicationBackend:
+    """Build the backend for a mission context's transport.
 
-    `configuration` is the MISSION's, not the provisioned one -- the transport,
-    the peer map and the TLS material are all mission-scoped now.
+    `configuration` is the mission's :class:`MissionContext` -- the transport
+    and the peer map are mission-scoped, so there is no provisioned fallback.
     """
-    configuration = configuration if configuration is not None else runner._configuration
     protocol = configuration.communication_protocol
     if protocol in HTTP_PROTOCOLS:
         from gradys_embedded.communication.http import HttpBackend

@@ -21,13 +21,13 @@ class CommunicationBackend(ABC):
     and ``runner._encapsulator`` (delivery target; ``None`` before the protocol starts).
     """
 
-    def __init__(self, runner: "EmbeddedRunner", configuration=None) -> None:
+    def __init__(self, runner: "EmbeddedRunner", configuration) -> None:
         self._runner = runner
-        # The MISSION's configuration, not the provisioned one. The transport, the
-        # peer map and the TLS material are all mission-scoped, and a backend is
-        # built per mission -- reading runner._configuration here would silently
-        # ignore everything the mission supplied, because it is never reassigned.
-        self._configuration = configuration if configuration is not None else runner._configuration
+        # The MISSION's context, never the provisioned config alone. The
+        # transport and the peer map are mission-scoped and a backend is built
+        # per mission; a fallback to runner._configuration would silently ignore
+        # everything the mission supplied.
+        self._configuration = configuration
         self._logger = logging.getLogger(type(self).__module__)
         # asyncio only holds a weak reference to a running task, so an
         # unreferenced fire-and-forget send can be garbage-collected before it
@@ -51,14 +51,12 @@ class CommunicationBackend(ABC):
 
     @property
     def _port(self) -> int:
-        """This node's data-plane port.
+        """This node's data-plane port: the provisioned ``data_port``.
 
-        Provisioned via ``data_port``, falling back to ``node_ip_dict`` for
-        configs written before the peer map became mission-supplied. Resolved at
-        bind time, so it is a property of the machine and never changes with a
-        mission.
+        A property of the machine; it never changes with a mission -- only the
+        transport serving it does.
         """
-        return self._configuration.resolve_data_port()
+        return self._configuration.data_port
 
     @abstractmethod
     async def serve(self) -> None:

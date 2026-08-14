@@ -66,15 +66,15 @@ def _clear():
     FIRED.clear()
 
 
-def _run(configuration, loop, protocol, backend=None):
-    encapsulator = EmbeddedEncapsulator(configuration, loop, None, backend=backend)
+def _run(mission_context, loop, protocol, backend=None):
+    encapsulator = EmbeddedEncapsulator(mission_context, loop, None, backend=backend)
     encapsulator.encapsulate(protocol)
     encapsulator.initialize()
     return encapsulator
 
 
-def test_finish_cancels_every_timer(configuration, loop):
-    encapsulator = _run(configuration, loop, SelfRescheduling)
+def test_finish_cancels_every_timer(mission_context, loop):
+    encapsulator = _run(mission_context, loop, SelfRescheduling)
     loop.run_until_complete(asyncio.sleep(0.08))
     assert encapsulator.provider.tracked_variables["hits"] >= 2
 
@@ -84,13 +84,13 @@ def test_finish_cancels_every_timer(configuration, loop):
     assert encapsulator.provider._active is False
 
 
-def test_no_timer_leaks_into_the_next_mission(configuration, loop):
-    first = _run(configuration, loop, SelfRescheduling)
+def test_no_timer_leaks_into_the_next_mission(mission_context, loop):
+    first = _run(mission_context, loop, SelfRescheduling)
     loop.run_until_complete(asyncio.sleep(0.08))
     first.finish()
 
     FIRED.clear()
-    second = _run(configuration, loop, Second)
+    second = _run(mission_context, loop, Second)
     loop.run_until_complete(asyncio.sleep(0.08))
 
     assert "second" in FIRED
@@ -98,9 +98,9 @@ def test_no_timer_leaks_into_the_next_mission(configuration, loop):
     second.finish()
 
 
-def test_stopped_protocol_cannot_command_the_vehicle(configuration, loop):
+def test_stopped_protocol_cannot_command_the_vehicle(mission_context, loop):
     """After a stop the vehicle is returning, and may already be disarmed."""
-    encapsulator = _run(configuration, loop, SelfRescheduling)
+    encapsulator = _run(mission_context, loop, SelfRescheduling)
     encapsulator.finish()
 
     encapsulator.provider.send_mobility_command(
@@ -110,9 +110,9 @@ def test_stopped_protocol_cannot_command_the_vehicle(configuration, loop):
     assert encapsulator.provider._pending_tasks == set()
 
 
-def test_stopped_protocol_cannot_send_messages(configuration, loop):
+def test_stopped_protocol_cannot_send_messages(mission_context, loop):
     backend = RecordingBackend()
-    encapsulator = _run(configuration, loop, SelfRescheduling, backend=backend)
+    encapsulator = _run(mission_context, loop, SelfRescheduling, backend=backend)
 
     encapsulator.provider.send_communication_command(
         CommunicationCommand(command_type=CommunicationCommandType.BROADCAST, message="before")
@@ -126,9 +126,9 @@ def test_stopped_protocol_cannot_send_messages(configuration, loop):
     assert len(backend.sent) == 1, "a stopped protocol still reached the network"
 
 
-def test_late_delivery_to_a_finished_mission_is_dropped(configuration, loop):
+def test_late_delivery_to_a_finished_mission_is_dropped(mission_context, loop):
     """A packet already dispatched, or a telemetry tick in flight, can land late."""
-    encapsulator = _run(configuration, loop, SelfRescheduling)
+    encapsulator = _run(mission_context, loop, SelfRescheduling)
     encapsulator.finish()
     FIRED.clear()
 
@@ -138,20 +138,20 @@ def test_late_delivery_to_a_finished_mission_is_dropped(configuration, loop):
     assert FIRED == []
 
 
-def test_finish_is_idempotent(configuration, loop):
-    encapsulator = _run(configuration, loop, SelfRescheduling)
+def test_finish_is_idempotent(mission_context, loop):
+    encapsulator = _run(mission_context, loop, SelfRescheduling)
     encapsulator.finish()
     encapsulator.finish()
 
 
-def test_finish_still_tears_down_when_the_protocol_raises(configuration, loop):
+def test_finish_still_tears_down_when_the_protocol_raises(mission_context, loop):
     """A protocol that throws must not leave its timers running forever."""
 
     class Exploding(SelfRescheduling):
         def finish(self):
             raise RuntimeError("boom")
 
-    encapsulator = _run(configuration, loop, Exploding)
+    encapsulator = _run(mission_context, loop, Exploding)
     loop.run_until_complete(asyncio.sleep(0.05))
 
     with pytest.raises(RuntimeError):
@@ -161,7 +161,7 @@ def test_finish_still_tears_down_when_the_protocol_raises(configuration, loop):
     assert encapsulator.provider._active is False
 
 
-def test_provider_shutdown_leaves_the_shared_session_alone(configuration, loop):
+def test_provider_shutdown_leaves_the_shared_session_alone(mission_context, loop):
     """close() is process-scoped: the session is shared with telemetry and uav_api."""
 
     class FakeSession:
@@ -171,7 +171,7 @@ def test_provider_shutdown_leaves_the_shared_session_alone(configuration, loop):
             self.closed = True
 
     session = FakeSession()
-    encapsulator = EmbeddedEncapsulator(configuration, loop, session, backend=None)
+    encapsulator = EmbeddedEncapsulator(mission_context, loop, session, backend=None)
     encapsulator.encapsulate(SelfRescheduling)
     encapsulator.initialize()
 

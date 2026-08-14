@@ -7,6 +7,8 @@ import pytest
 
 from gradys_embedded.runner.mission import MissionError, MissionState
 
+from tests.conftest import MISSION_KWARGS
+
 RUN_INFO = "RUN_INFO.json"
 
 
@@ -44,13 +46,13 @@ def test_setup_and_start_require_a_loaded_mission(runner, loop):
 
 
 def test_start_requires_setup(runner, loop, demo_protocol):
-    loop.run_until_complete(runner.mission.load(protocol=demo_protocol))
+    loop.run_until_complete(runner.mission.load(protocol=demo_protocol, **MISSION_KWARGS))
     with pytest.raises(MissionError):
         loop.run_until_complete(runner.mission.start())
 
 
 def test_load_creates_a_run_directory(runner, loop, demo_protocol):
-    status = loop.run_until_complete(runner.mission.load(protocol=demo_protocol, label="alpha"))
+    status = loop.run_until_complete(runner.mission.load(protocol=demo_protocol, **MISSION_KWARGS, label="alpha"))
 
     assert status["state"] == "loaded"
     assert status["run_id"].endswith("_alpha")
@@ -61,20 +63,20 @@ def test_load_creates_a_run_directory(runner, loop, demo_protocol):
 
 
 def test_load_rejected_while_a_mission_is_active(runner, loop, demo_protocol):
-    loop.run_until_complete(runner.mission.load(protocol=demo_protocol))
+    loop.run_until_complete(runner.mission.load(protocol=demo_protocol, **MISSION_KWARGS))
     with pytest.raises(MissionError) as excinfo:
-        loop.run_until_complete(runner.mission.load(protocol=demo_protocol))
+        loop.run_until_complete(runner.mission.load(protocol=demo_protocol, **MISSION_KWARGS))
     assert excinfo.value.status_code == 409
 
 
 def test_protocol_resolves_from_a_bare_module_name(runner, loop, demo_protocol):
     """An uploaded file usually holds exactly one protocol; naming it is optional."""
-    status = loop.run_until_complete(runner.mission.load(protocol="demo"))
+    status = loop.run_until_complete(runner.mission.load(protocol="demo", **MISSION_KWARGS))
     assert status["state"] == "loaded"
 
 
 def test_setup_failure_is_retryable(runner, loop, demo_protocol):
-    loop.run_until_complete(runner.mission.load(protocol=demo_protocol))
+    loop.run_until_complete(runner.mission.load(protocol=demo_protocol, **MISSION_KWARGS))
     runner.setup_succeeds = False
 
     with pytest.raises(MissionError) as excinfo:
@@ -87,7 +89,7 @@ def test_setup_failure_is_retryable(runner, loop, demo_protocol):
 
 
 def _fly(runner, loop, protocol, label=None):
-    loop.run_until_complete(runner.mission.load(protocol=protocol, label=label))
+    loop.run_until_complete(runner.mission.load(protocol=protocol, **MISSION_KWARGS, label=label))
     loop.run_until_complete(runner.mission.setup())
     loop.run_until_complete(runner.mission.start())
 
@@ -120,7 +122,7 @@ def test_stop_halts_the_protocol_before_returning(runner, loop, demo_protocol):
 
 
 def test_stop_without_flying_does_not_command_rtl(runner, loop, demo_protocol):
-    loop.run_until_complete(runner.mission.load(protocol=demo_protocol))
+    loop.run_until_complete(runner.mission.load(protocol=demo_protocol, **MISSION_KWARGS))
     loop.run_until_complete(runner.mission.stop())
 
     assert runner.mission.state is MissionState.IDLE
@@ -197,5 +199,5 @@ def test_disk_threshold_blocks_a_new_run(runner, loop, demo_protocol):
     runner._configuration.min_free_disk_mb = 10 ** 9
 
     with pytest.raises(MissionError) as excinfo:
-        loop.run_until_complete(runner.mission.load(protocol=demo_protocol))
+        loop.run_until_complete(runner.mission.load(protocol=demo_protocol, **MISSION_KWARGS))
     assert excinfo.value.status_code == 507

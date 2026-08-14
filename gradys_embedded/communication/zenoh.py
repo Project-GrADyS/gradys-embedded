@@ -30,7 +30,7 @@ _QUIC_PROTOCOL = "zenoh_quic"
 
 
 class ZenohBackend(CommunicationBackend):
-    def __init__(self, runner: "EmbeddedRunner", configuration=None) -> None:
+    def __init__(self, runner: "EmbeddedRunner", configuration) -> None:
         super().__init__(runner, configuration)
         self._is_quic = self._configuration.communication_protocol == _QUIC_PROTOCOL
         self._scheme = "quic" if self._is_quic else "tcp"
@@ -65,9 +65,18 @@ class ZenohBackend(CommunicationBackend):
             return cfg
 
         # Option B: no multicast; connect explicitly to peers listed in node_ip_dict.
+        peers = self._configuration.node_ip_dict
+        if not peers or self._configuration.node_id not in peers:
+            # Backstop behind the load-time 400: reached only if a backend is
+            # built outside the mission path. Raising here fails the bind
+            # handshake instead of leaving a dead serve task.
+            raise RuntimeError(
+                "zenoh without auto_scout requires a node_ip_dict that includes "
+                "this node's own entry to build its listen endpoint."
+            )
         cfg.insert_json5("scouting/multicast/enabled", "false")
         cfg.insert_json5("scouting/gossip/enabled", "true")
-        own_ip = self._configuration.node_ip_dict[self._configuration.node_id].rsplit(":", 1)[0]
+        own_ip = peers[self._configuration.node_id].rsplit(":", 1)[0]
         cfg.insert_json5("listen/endpoints", json.dumps([f"{self._scheme}/{own_ip}:{self._port}"]))
         connect = [
             f"{self._scheme}/{addr}"

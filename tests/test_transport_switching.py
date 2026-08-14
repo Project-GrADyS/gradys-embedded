@@ -11,9 +11,16 @@ import socket
 
 import pytest
 
-from gradys_embedded.runner.configuration import RunnerConfiguration
+from gradys_embedded.runner.configuration import (
+    MissionConfiguration,
+    MissionContext,
+    RunnerConfiguration,
+)
 from gradys_embedded.runner.mission import MissionError
 from gradys_embedded.runner.runner import EmbeddedRunner
+
+# The `runner` fixture's node_id is 3; zenoh missions need the node's own entry.
+PEERS = {3: "127.0.0.1:5000"}
 
 
 def free_port() -> int:
@@ -30,6 +37,11 @@ def is_listening(port: int) -> bool:
         return s.connect_ex(("127.0.0.1", port)) == 0
 
 
+def _ctx(runner, **mission_kwargs) -> MissionContext:
+    """What load() would hand start_backend for a mission with these params."""
+    return MissionContext(runner._configuration, MissionConfiguration(**mission_kwargs))
+
+
 @pytest.fixture
 def bound_runner(tmp_path, loop):
     """A real runner whose data plane can actually bind."""
@@ -38,7 +50,6 @@ def bound_runner(tmp_path, loop):
         uav_api_port=8000,
         control_api_port=free_port(),
         data_port=free_port(),
-        node_ip_dict={1: "127.0.0.1:5000"},
         runs_dir=str(tmp_path / "runs"),
         protocols_dir=str(tmp_path / "protocols"),
         min_free_disk_mb=0,
@@ -62,17 +73,16 @@ def test_nothing_is_served_until_a_mission_is_loaded(bound_runner):
 
 
 def test_start_backend_binds_the_data_port(bound_runner, loop):
-    loop.run_until_complete(bound_runner.start_backend(bound_runner._configuration))
-    _settle(loop)
+    loop.run_until_complete(bound_runner.start_backend(_ctx(bound_runner)))
 
+    # No settle: start_backend returning IS the readiness contract.
     assert is_listening(bound_runner._configuration.data_port)
     assert bound_runner._backend is not None
 
 
 def test_stop_backend_releases_the_port(bound_runner, loop):
     port = bound_runner._configuration.data_port
-    loop.run_until_complete(bound_runner.start_backend(bound_runner._configuration))
-    _settle(loop)
+    loop.run_until_complete(bound_runner.start_backend(_ctx(bound_runner)))
     assert is_listening(port)
 
     loop.run_until_complete(bound_runner.stop_backend())
@@ -84,19 +94,15 @@ def test_stop_backend_releases_the_port(bound_runner, loop):
 
 def test_switching_transport_rebinds_the_same_port(bound_runner, loop):
     """The whole point: a different transport, same port, same process."""
-    from dataclasses import replace
-
     port = bound_runner._configuration.data_port
-    http_config = bound_runner._configuration
 
-    loop.run_until_complete(bound_runner.start_backend(http_config))
-    _settle(loop)
+    loop.run_until_complete(bound_runner.start_backend(_ctx(bound_runner)))
     first = bound_runner._backend
     assert first._protocol == "http"
 
-    https_config = replace(http_config, communication_protocol="https")
-    loop.run_until_complete(bound_runner.start_backend(https_config))
-    _settle(loop, 0.6)
+    loop.run_until_complete(
+        bound_runner.start_backend(_ctx(bound_runner, communication_protocol="https"))
+    )
 
     assert bound_runner._backend is not first, "backend was not rebuilt"
     assert bound_runner._backend._protocol == "https"
@@ -105,11 +111,10 @@ def test_switching_transport_rebinds_the_same_port(bound_runner, loop):
 
 def test_same_transport_is_reused_without_rebinding(bound_runner, loop):
     """Consecutive missions on one transport must not churn the listener."""
-    loop.run_until_complete(bound_runner.start_backend(bound_runner._configuration))
-    _settle(loop)
+    loop.run_until_complete(bound_runner.start_backend(_ctx(bound_runner)))
     first = bound_runner._backend
 
-    loop.run_until_complete(bound_runner.start_backend(bound_runner._configuration))
+    loop.run_until_complete(bound_runner.start_backend(_ctx(bound_runner)))
 
     assert bound_runner._backend is first, "an unchanged transport rebound the port"
 
@@ -120,18 +125,16 @@ def test_stop_backend_is_safe_when_nothing_is_running(bound_runner, loop):
 
 
 def test_backend_is_built_from_the_mission_configuration(bound_runner, loop):
-    """Regression: the backend used to capture the PROVISIONED config, so a
-    mission-supplied peer map never reached the send path."""
-    from dataclasses import replace
-
+    """The backend reads the MISSION's context; the provisioned config cannot
+    even carry a peer map for it to fall back to."""
     mission_peers = {1: "127.0.0.1:5000", 9: "10.9.9.9:5000"}
-    mission_config = replace(bound_runner._configuration, node_ip_dict=mission_peers)
 
-    loop.run_until_complete(bound_runner.start_backend(mission_config))
-    _settle(loop)
+    loop.run_until_complete(
+        bound_runner.start_backend(_ctx(bound_runner, node_ip_dict=mission_peers))
+    )
 
     assert bound_runner._backend._configuration.node_ip_dict == mission_peers
-    assert bound_runner._configuration.node_ip_dict != mission_peers
+    assert not hasattr(bound_runner._configuration, "node_ip_dict")
 
 
 # ---------------------------------------------------------- load rejections
@@ -155,7 +158,8 @@ def test_transport_needing_a_missing_extra_is_rejected(runner, loop, demo_protoc
 
     with pytest.raises(MissionError) as excinfo:
         loop.run_until_complete(runner.mission.load(
-            protocol=demo_protocol, communication_protocol="zenoh_tcp"))
+            protocol=demo_protocol, communication_protocol="zenoh_tcp",
+            node_ip_dict=PEERS))
 
     assert excinfo.value.status_code == 400
     assert "gradys-embedded[zenoh]" in str(excinfo.value)
@@ -172,7 +176,8 @@ def test_zenoh_quic_without_a_fleet_cert_is_rejected(runner, loop, demo_protocol
 
     with pytest.raises(MissionError) as excinfo:
         loop.run_until_complete(runner.mission.load(
-            protocol=demo_protocol, communication_protocol="zenoh_quic"))
+            protocol=demo_protocol, communication_protocol="zenoh_quic",
+            node_ip_dict=PEERS))
 
     assert excinfo.value.status_code == 400
     assert "fleet-wide" in str(excinfo.value)
@@ -187,7 +192,7 @@ def test_zenoh_quic_is_allowed_with_a_provisioned_cert(runner, loop, demo_protoc
 
     status = loop.run_until_complete(runner.mission.load(
         protocol=demo_protocol, communication_protocol="zenoh_quic",
-        initial_position=[0.0, 0.0, 10.0]))
+        node_ip_dict=PEERS, initial_position=[0.0, 0.0, 10.0]))
 
     assert status["frame"]["communication_protocol"] == "zenoh_quic"
 
@@ -203,9 +208,11 @@ def test_a_rejected_transport_leaves_no_orphan_run(runner, loop, demo_protocol):
 
 # ------------------------------------------------------------- the contract
 
-def test_transport_defaults_to_the_provisioned_value(runner, loop, demo_protocol):
-    """Keeps gradys-sitl-tester, the examples and /protocol/setup working."""
-    status = loop.run_until_complete(runner.mission.load(protocol=demo_protocol))
+def test_transport_defaults_to_http(runner, loop, demo_protocol):
+    """A load that names no transport gets plain http, the MissionConfiguration
+    default — there is no provisioned transport to fall back to."""
+    status = loop.run_until_complete(runner.mission.load(
+        protocol=demo_protocol, node_ip_dict=PEERS))
 
     assert status["frame"]["communication_protocol"] == "http"
     assert runner.served_protocol == "http"
@@ -214,19 +221,21 @@ def test_transport_defaults_to_the_provisioned_value(runner, loop, demo_protocol
 def test_status_echoes_the_transport_for_fleet_verification(runner, loop, demo_protocol):
     status = loop.run_until_complete(runner.mission.load(
         protocol=demo_protocol, communication_protocol="https",
-        initial_position=[0.0, 0.0, 10.0]))
+        node_ip_dict=PEERS, initial_position=[0.0, 0.0, 10.0]))
 
     assert status["frame"]["communication_protocol"] == "https"
     assert runner.served_protocol == "https"
 
 
 def test_loading_a_different_transport_restarts_the_data_plane(runner, loop, demo_protocol):
-    loop.run_until_complete(runner.mission.load(protocol=demo_protocol))
+    loop.run_until_complete(runner.mission.load(
+        protocol=demo_protocol, node_ip_dict=PEERS))
     loop.run_until_complete(runner.mission.stop())
     assert runner.backend_starts == 1
 
     loop.run_until_complete(runner.mission.load(
-        protocol=demo_protocol, communication_protocol="https"))
+        protocol=demo_protocol, communication_protocol="https",
+        node_ip_dict=PEERS))
 
     assert runner.backend_starts == 2
     assert runner.backend_stops == 1
@@ -234,9 +243,11 @@ def test_loading_a_different_transport_restarts_the_data_plane(runner, loop, dem
 
 
 def test_reloading_the_same_transport_does_not_restart_it(runner, loop, demo_protocol):
-    loop.run_until_complete(runner.mission.load(protocol=demo_protocol))
+    loop.run_until_complete(runner.mission.load(
+        protocol=demo_protocol, node_ip_dict=PEERS))
     loop.run_until_complete(runner.mission.stop())
-    loop.run_until_complete(runner.mission.load(protocol=demo_protocol))
+    loop.run_until_complete(runner.mission.load(
+        protocol=demo_protocol, node_ip_dict=PEERS))
 
     assert runner.backend_starts == 1
     assert runner.backend_reuses == 1

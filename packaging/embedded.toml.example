@@ -6,16 +6,19 @@
 # Install to /etc/gradys/embedded.toml and run:
 #     gradys-embedded --config /etc/gradys/embedded.toml
 
+# Only provisioned, machine-bound settings live here. Everything describing an
+# experiment -- the protocol, the peer map (node_ip_dict), the coordinate frame
+# (origin_gps_coordinates, x_axis_degrees), initial_position, the transport
+# (communication_protocol, auto_scout) and telemetry_interval -- is supplied per
+# mission in POST /mission/load and is REJECTED by this loader.
+
 # --- Identity (differs per drone) --------------------------------------------
 
-# Must be a key of [node_ip_dict] below. By fleet convention this equals the
-# uav_api sysid and the flight controller's SYSID_THISMAV, though nothing in
-# the software enforces that.
+# Must match the mission layer's inventory (the node ids used in each mission's
+# node_ip_dict). By fleet convention this equals the uav_api sysid and the
+# flight controller's SYSID_THISMAV, though nothing in the software enforces
+# that.
 node_id = 1
-
-# Cartesian NEU metres from origin_gps_coordinates. The z component doubles as
-# the takeoff altitude. Two drones must never share an initial_position.
-initial_position = [0.0, 0.0, 10.0]
 
 # --- Local services ----------------------------------------------------------
 
@@ -24,6 +27,11 @@ uav_api_port = 8000
 
 # Control plane: the /mission, /protocols and /runs endpoints land here.
 control_api_port = 6000
+
+# Port this node binds for the inter-node data plane. Which transport serves it
+# (http/https/http3/zenoh_tcp/zenoh_quic) is chosen per mission at
+# POST /mission/load; the port itself belongs to the machine.
+data_port = 5000
 
 # --- Run data ----------------------------------------------------------------
 
@@ -41,40 +49,30 @@ protocols_dir = "~/gradys_protocols"
 # refused start. Set 0 to disable.
 min_free_disk_mb = 200
 
-# --- Fleet-wide invariants ---------------------------------------------------
+# --- TLS (optional) ----------------------------------------------------------
 #
-# These MUST be identical on every node. Nothing validates that at runtime, and
-# a mismatch does not raise -- it silently desynchronizes the fleet.
-
-# Leaving this unset makes each drone use its own boot GPS fix as the origin,
-# which places every drone in a different coordinate frame. Always set it
-# explicitly for a fleet.
-origin_gps_coordinates = [-15.840081, -47.926642, 0.016]
-
-# Clockwise rotation of the protocol x-axis from true north. 0.0 keeps the NEU
-# convention (x=North, y=East).
-x_axis_degrees = 0.0
-
-# One of: http, https, http3, zenoh_tcp, zenoh_quic.
-# http3 requires the [http3] extra; zenoh_* require the [zenoh] extra.
+# Fleet-wide certificate pair, identical on every drone. Used by the https and
+# http3 transports, and REQUIRED before a mission may choose zenoh_quic (load
+# rejects it otherwise). Leave unset to serve https/http3 with an ephemeral
+# self-signed certificate.
 #
-# A DEFAULT, not a fixed setting: POST /mission/load chooses the transport per
-# run, and only the chosen one is ever served. The data plane binds nothing until
-# a mission loads. zenoh_quic additionally needs a fleet-wide certfile/keyfile,
-# identical on every drone, or load rejects it.
-communication_protocol = "http"
+# certfile = "/etc/gradys/fleet-cert.pem"
+# keyfile  = "/etc/gradys/fleet-key.pem"
 
-# Seconds between telemetry polls.
-telemetry_interval = 0.5
-
-# --- Peer directory ----------------------------------------------------------
+# --- Where the mission parameters went ---------------------------------------
 #
-# Values are bare "host:port" with NO scheme. The transport builds
-# "http://{addr}/message" itself, so a value containing http:// produces
-# "http://http://..." and every send fails silently. The loader rejects this.
+# A mission is loaded over HTTP; that request carries everything experiment-
+# scoped. For example:
 #
-# Must be identical on every node.
-[node_ip_dict]
-1 = "10.0.2.11:5000"
-2 = "10.0.2.12:5000"
-3 = "10.0.2.13:5000"
+#   curl -X POST http://<drone>:6000/mission/load -H 'Content-Type: application/json' -d '{
+#     "protocol": "my_protocol:MyProtocol",
+#     "node_ip_dict": {"1": "10.0.2.11:5000", "2": "10.0.2.12:5000"},
+#     "initial_position": [0.0, 0.0, 10.0],
+#     "origin_gps_coordinates": [-15.840081, -47.926642, 0.016],
+#     "x_axis_degrees": 0.0,
+#     "communication_protocol": "http"
+#   }'
+#
+# node_ip_dict values are bare "host:port" with NO scheme, identical on every
+# node; the frame must also be identical fleet-wide. /mission/status echoes them
+# so the mission layer can verify agreement before starting.

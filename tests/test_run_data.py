@@ -14,6 +14,8 @@ from gradys_embedded.protocol.plugin.statistics import (
 )
 from gradys_embedded.runner.mission import MissionError
 
+from tests.conftest import MISSION_KWARGS
+
 
 def _rows(path):
     return len(path.read_text().strip().splitlines()) - 1  # minus the header
@@ -36,14 +38,14 @@ def test_run_ids_cannot_escape_the_runs_directory(runner, name):
 
 
 def test_run_files_cannot_escape_the_run_directory(runner, loop, demo_protocol):
-    status = loop.run_until_complete(runner.mission.load(protocol=demo_protocol))
+    status = loop.run_until_complete(runner.mission.load(protocol=demo_protocol, **MISSION_KWARGS))
     with pytest.raises(MissionError) as excinfo:
         runner.mission.run_file(status["run_id"], "../../../etc/passwd")
     assert excinfo.value.status_code in (400, 404)
 
 
 def test_listing_reports_disk_usage(runner, loop, demo_protocol):
-    loop.run_until_complete(runner.mission.load(protocol=demo_protocol))
+    loop.run_until_complete(runner.mission.load(protocol=demo_protocol, **MISSION_KWARGS))
     listing = runner.mission.list_runs()
 
     assert len(listing["runs"]) == 1
@@ -52,7 +54,7 @@ def test_listing_reports_disk_usage(runner, loop, demo_protocol):
 
 
 def test_delete_removes_a_run(runner, loop, demo_protocol):
-    run_id = loop.run_until_complete(runner.mission.load(protocol=demo_protocol))["run_id"]
+    run_id = loop.run_until_complete(runner.mission.load(protocol=demo_protocol, **MISSION_KWARGS))["run_id"]
     loop.run_until_complete(runner.mission.stop())
 
     runner.mission.delete_run(run_id)
@@ -63,7 +65,7 @@ def test_delete_removes_a_run(runner, loop, demo_protocol):
 
 
 def test_refuses_to_delete_the_run_in_progress(runner, loop, demo_protocol):
-    run_id = loop.run_until_complete(runner.mission.load(protocol=demo_protocol))["run_id"]
+    run_id = loop.run_until_complete(runner.mission.load(protocol=demo_protocol, **MISSION_KWARGS))["run_id"]
     loop.run_until_complete(runner.mission.setup())
 
     with pytest.raises(MissionError):
@@ -170,13 +172,13 @@ class StatsProtocol(IProtocol):
         finish_statistics(self)
 
 
-def test_statistics_timer_keeps_rescheduling(configuration, loop, tmp_path):
+def test_statistics_timer_keeps_rescheduling(mission_context, loop, tmp_path):
     """Regression: the interval was read off the protocol instead of the wrapper,
     so the first statistics timer raised AttributeError and never rescheduled --
     every flight produced a simulation_real_time CSV with a single row."""
     StatsProtocol.output_dir = tmp_path
 
-    encapsulator = EmbeddedEncapsulator(configuration, loop, None, backend=None)
+    encapsulator = EmbeddedEncapsulator(mission_context, loop, None, backend=None)
     encapsulator.encapsulate(StatsProtocol)
     encapsulator.initialize()
     loop.run_until_complete(asyncio.sleep(0.7))
@@ -186,10 +188,10 @@ def test_statistics_timer_keeps_rescheduling(configuration, loop, tmp_path):
     assert _rows(srt) >= 5, f"statistics timer stopped rescheduling: {_rows(srt)} rows"
 
 
-def test_statistics_write_into_the_run_directory(configuration, loop, tmp_path):
+def test_statistics_write_into_the_run_directory(mission_context, loop, tmp_path):
     StatsProtocol.output_dir = tmp_path
 
-    encapsulator = EmbeddedEncapsulator(configuration, loop, None, backend=None)
+    encapsulator = EmbeddedEncapsulator(mission_context, loop, None, backend=None)
     encapsulator.encapsulate(StatsProtocol)
     encapsulator.initialize()
     loop.run_until_complete(asyncio.sleep(0.3))
@@ -200,11 +202,11 @@ def test_statistics_write_into_the_run_directory(configuration, loop, tmp_path):
     assert "messages_sent" in tracked.read_text().splitlines()[0]
 
 
-def test_statistics_flush_before_finish(configuration, loop, tmp_path):
+def test_statistics_flush_before_finish(mission_context, loop, tmp_path):
     """A killed process must not lose the whole run."""
     StatsProtocol.output_dir = tmp_path
 
-    encapsulator = EmbeddedEncapsulator(configuration, loop, None, backend=None)
+    encapsulator = EmbeddedEncapsulator(mission_context, loop, None, backend=None)
     encapsulator.encapsulate(StatsProtocol)
     encapsulator.initialize()
     loop.run_until_complete(asyncio.sleep(0.5))
@@ -214,12 +216,12 @@ def test_statistics_flush_before_finish(configuration, loop, tmp_path):
     encapsulator.finish()
 
 
-def test_statistics_registries_are_emptied(configuration, loop, tmp_path):
+def test_statistics_registries_are_emptied(mission_context, loop, tmp_path):
     """Both registries are module-global and keyed by protocol instance, so a
     long-running service would leak one wrapper per mission."""
     StatsProtocol.output_dir = tmp_path
 
-    encapsulator = EmbeddedEncapsulator(configuration, loop, None, backend=None)
+    encapsulator = EmbeddedEncapsulator(mission_context, loop, None, backend=None)
     encapsulator.encapsulate(StatsProtocol)
     encapsulator.initialize()
     loop.run_until_complete(asyncio.sleep(0.15))
@@ -229,10 +231,10 @@ def test_statistics_registries_are_emptied(configuration, loop, tmp_path):
     assert dispatcher._protocol_wrappers == {}
 
 
-def test_finishing_statistics_twice_is_safe(configuration, loop, tmp_path):
+def test_finishing_statistics_twice_is_safe(mission_context, loop, tmp_path):
     StatsProtocol.output_dir = tmp_path
 
-    encapsulator = EmbeddedEncapsulator(configuration, loop, None, backend=None)
+    encapsulator = EmbeddedEncapsulator(mission_context, loop, None, backend=None)
     encapsulator.encapsulate(StatsProtocol)
     encapsulator.initialize()
     loop.run_until_complete(asyncio.sleep(0.15))

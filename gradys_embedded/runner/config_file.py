@@ -4,11 +4,13 @@ Without this, every drone needs a hand-written runner script carrying a
 ``RunnerConfiguration`` literal, which makes fleet provisioning mean generating
 Python source. A data file can be templated safely and diffed between drones.
 
-The loader is deliberately strict: unknown or malformed keys raise rather than
-warn. A fleet's configuration is generated, so a key that does not apply is a
-bug in the generator, and the failure modes it would otherwise cause (a drone
-in a different coordinate frame, a peer directory that silently drops messages)
-are invisible until after a flight.
+The loader is deliberately strict: unknown, malformed or mission-level keys
+raise rather than warn. A fleet's configuration is generated, so a key that
+does not apply is a bug in the generator, and the failure modes it would
+otherwise cause (a port that never binds, a mission parameter an operator
+believes is set but is silently ignored) are invisible until after a flight.
+Only provisioned, machine-bound keys belong here; everything describing an
+experiment goes through POST /mission/load.
 """
 
 import tomllib
@@ -16,10 +18,12 @@ from dataclasses import MISSING, fields
 from pathlib import Path
 from typing import Any
 
-from gradys_embedded.runner.configuration import RunnerConfiguration
+from gradys_embedded.runner.configuration import MissionConfiguration, RunnerConfiguration
 
-# Declared as tuples on the dataclass; TOML can only express arrays.
-_TUPLE_FIELDS = {"initial_position", "origin_gps_coordinates"}
+# Mission-level parameters describe an experiment, not a machine. They are NOT
+# provisionable: POST /mission/load is their only gateway, so the loader rejects
+# them by name rather than leaving a config that silently half-applies.
+_MISSION_LEVEL_KEYS = frozenset(f.name for f in fields(MissionConfiguration))
 
 # Keys the loader once accepted, with a pointed error instead of the generic
 # unknown-key one: the message is the migration path for configs written
@@ -36,46 +40,20 @@ class ConfigurationError(ValueError):
     """Raised when a configuration file cannot be turned into a valid runner configuration."""
 
 
-def _coerce_node_ip_dict(raw: Any) -> dict[int, str]:
-    """TOML table keys are always strings; the runner keys peers by int node_id."""
-    if not isinstance(raw, dict):
-        raise ConfigurationError(
-            f"node_ip_dict must be a table of node_id = \"ip:port\", got {type(raw).__name__}"
-        )
-
-    coerced: dict[int, str] = {}
-    for key, value in raw.items():
-        try:
-            node_id = int(key)
-        except (TypeError, ValueError):
-            raise ConfigurationError(
-                f"node_ip_dict key {key!r} is not an integer node id"
-            ) from None
-
-        if not isinstance(value, str):
-            raise ConfigurationError(
-                f"node_ip_dict[{node_id}] must be a string, got {type(value).__name__}"
-            )
-
-        # The send path builds f"http://{addr}/message", so a scheme here yields
-        # "http://http://..." and every send fails silently. Catch it at load
-        # time rather than in flight.
-        if "://" in value:
-            raise ConfigurationError(
-                f"node_ip_dict[{node_id}] = {value!r} must not include a scheme. "
-                f"Use the bare form \"host:port\" -- the transport adds the scheme itself."
-            )
-
-        coerced[node_id] = value
-
-    return coerced
-
-
 def parse_configuration(data: dict[str, Any]) -> RunnerConfiguration:
     """Build a runner configuration from an already-parsed TOML mapping."""
     data = dict(data)
 
     known = {f.name: f for f in fields(RunnerConfiguration)}
+
+    mission_level = sorted(set(data) & _MISSION_LEVEL_KEYS)
+    if mission_level:
+        raise ConfigurationError(
+            f"Mission-level key(s) in the provisioned configuration: "
+            f"{', '.join(mission_level)}. These describe an experiment, not a "
+            f"machine -- supply them in POST /mission/load; they can no longer "
+            f"be provisioned."
+        )
 
     removed = sorted(set(data) & set(_REMOVED_KEYS))
     if removed:
@@ -99,17 +77,8 @@ def parse_configuration(data: dict[str, Any]) -> RunnerConfiguration:
             f"Missing required configuration key(s): {', '.join(missing)}"
         )
 
-    kwargs: dict[str, Any] = {}
-    for name, value in data.items():
-        if name == "node_ip_dict":
-            kwargs[name] = _coerce_node_ip_dict(value)
-        elif name in _TUPLE_FIELDS and isinstance(value, list):
-            kwargs[name] = tuple(value)
-        else:
-            kwargs[name] = value
-
     try:
-        configuration = RunnerConfiguration(**kwargs)
+        configuration = RunnerConfiguration(**data)
     except (TypeError, ValueError) as exc:
         raise ConfigurationError(str(exc)) from exc
 

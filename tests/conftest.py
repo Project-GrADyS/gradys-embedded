@@ -11,8 +11,22 @@ import pytest
 
 from gradys_embedded.communication import ZENOH_PROTOCOLS
 from gradys_embedded.encapsulator.embedded import EmbeddedEncapsulator
-from gradys_embedded.runner.configuration import RunnerConfiguration
+from gradys_embedded.runner.configuration import (
+    MissionConfiguration,
+    MissionContext,
+    RunnerConfiguration,
+)
 from gradys_embedded.runner.mission import MissionManager
+
+# The mission-scoped parameters most tests load with. Mirrors what a mission
+# layer would put in POST /mission/load; node 3 matches the `configuration`
+# fixture's node_id.
+MISSION_KWARGS = dict(
+    node_ip_dict={3: "127.0.0.1:5000"},
+    initial_position=(0.0, 0.0, 10.0),
+    origin_gps_coordinates=(-15.840081, -47.926642, 0.0),
+    x_axis_degrees=0.0,
+)
 
 DEMO_PROTOCOL_SRC = '''
 from gradys_embedded.protocol.interface import IProtocol
@@ -86,10 +100,8 @@ class StubRunner:
         self.commands.append("goto_initial_position")
         return self.setup_succeeds
 
-    async def bootstrap_protocol(self, protocol_class, configuration=None):
-        encapsulator = EmbeddedEncapsulator(
-            configuration or self._configuration, self._loop, None, backend=None
-        )
+    async def bootstrap_protocol(self, protocol_class, configuration):
+        encapsulator = EmbeddedEncapsulator(configuration, self._loop, None, backend=None)
         encapsulator.encapsulate(protocol_class)
         self._encapsulator = encapsulator
         encapsulator.initialize()
@@ -107,16 +119,20 @@ class StubRunner:
 def configuration(tmp_path):
     return RunnerConfiguration(
         node_id=3,
-        node_ip_dict={3: "127.0.0.1:5000"},
-        initial_position=(0.0, 0.0, 10.0),
         uav_api_port=8000,
         control_api_port=6000,
-        origin_gps_coordinates=(-15.840081, -47.926642, 0.0),
-        x_axis_degrees=0.0,
+        data_port=5000,
         runs_dir=str(tmp_path / "runs"),
         protocols_dir=str(tmp_path / "protocols"),
         min_free_disk_mb=0,
     )
+
+
+@pytest.fixture
+def mission_context(configuration):
+    """The effective configuration of a loaded mission, for tests that build
+    encapsulators or backends directly rather than going through load()."""
+    return MissionContext(configuration, MissionConfiguration(**MISSION_KWARGS))
 
 
 @pytest.fixture
@@ -139,28 +155,3 @@ def demo_protocol(runner):
     """An uploaded protocol module, importable by name."""
     runner.mission.save_protocol("demo.py", DEMO_PROTOCOL_SRC.encode())
     return "demo:DemoProtocol"
-
-
-@pytest.fixture
-def provisioned_runner(tmp_path, loop):
-    """A drone provisioned the way gradys-fleet renders it after the narrowing:
-    machine-bound settings only, with no frame, initial position or peer map.
-
-    The default `configuration` fixture keeps the older shape, so both the new
-    and the transitional configurations stay covered.
-    """
-    configuration = RunnerConfiguration(
-        node_id=3,
-        uav_api_port=8000,
-        control_api_port=6000,
-        data_port=5000,
-        runs_dir=str(tmp_path / "provisioned-runs"),
-        protocols_dir=str(tmp_path / "provisioned-protocols"),
-        min_free_disk_mb=0,
-    )
-    runner = StubRunner(configuration, loop)
-    runner.mission = MissionManager(runner)
-    # A distinct module name so it cannot be shadowed by the other fixture's
-    # copy, which importlib would have already cached under "demo".
-    runner.mission.save_protocol("bare_demo.py", DEMO_PROTOCOL_SRC.encode())
-    return runner

@@ -46,10 +46,14 @@ class LoadRequest(BaseModel):
     node_ip_dict: Optional[Dict[int, str]] = None
 
     # The transport. Loading binds the data plane for it, and only for it.
-    # Defaults to the provisioned value (http unless changed), echoed in
-    # /mission/status so the caller can confirm the fleet agrees.
+    # Defaults to http, echoed in /mission/status so the caller can confirm the
+    # fleet agrees.
     communication_protocol: Optional[str] = None
     auto_scout: Optional[bool] = None
+
+    # Poll rate during this mission; while idle the service polls at its own
+    # fixed rate.
+    telemetry_interval: Optional[float] = None
 
 
 def _mission(runner: "EmbeddedRunner"):
@@ -109,6 +113,7 @@ def _build_mission_router(runner: "EmbeddedRunner") -> APIRouter:
                 node_ip_dict=request.node_ip_dict,
                 communication_protocol=request.communication_protocol,
                 auto_scout=request.auto_scout,
+                telemetry_interval=request.telemetry_interval,
             )
         except MissionError as exc:
             raise _handle(exc)

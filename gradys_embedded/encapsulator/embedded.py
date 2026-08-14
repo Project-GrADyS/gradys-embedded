@@ -10,7 +10,7 @@ from gradys_embedded.protocol.messages.communication import CommunicationCommand
 from gradys_embedded.protocol.messages.mobility import MobilityCommand, MobilityCommandType
 from gradys_embedded.protocol.messages.telemetry import Telemetry
 from gradys_embedded.protocol.position import cartesian_to_geo
-from gradys_embedded.runner.configuration import RunnerConfiguration
+from gradys_embedded.runner.configuration import MissionContext
 
 
 class EmbeddedProvider(IProvider):
@@ -19,11 +19,11 @@ class EmbeddedProvider(IProvider):
     calls into HTTP requests to the UAV API and inter-node message API.
     """
 
-    def __init__(self, runner_configuration: RunnerConfiguration, loop: asyncio.AbstractEventLoop, timer_callback: Callable[[str], None], session: aiohttp.ClientSession, backend=None):
-        self.node_id = runner_configuration.node_id
-        self.node_ip_dict = runner_configuration.node_ip_dict
-        self.origin_gps_coordinates = runner_configuration.origin_gps_coordinates
-        self.x_axis_degrees = runner_configuration.x_axis_degrees
+    def __init__(self, context: MissionContext, loop: asyncio.AbstractEventLoop, timer_callback: Callable[[str], None], session: aiohttp.ClientSession, backend=None):
+        self.node_id = context.node_id
+        self.node_ip_dict = context.node_ip_dict
+        self.origin_gps_coordinates = context.origin_gps_coordinates
+        self.x_axis_degrees = context.x_axis_degrees
         self._timer_callback: Callable[[str], None] = timer_callback
         self._session = session
 
@@ -31,7 +31,7 @@ class EmbeddedProvider(IProvider):
         self._logger = logging.getLogger(__name__)
 
         self._loop = loop
-        self._uav_base_url = f"http://localhost:{runner_configuration.uav_api_port}"
+        self._uav_base_url = f"http://localhost:{context.uav_api_port}"
         self._timers: dict[str, asyncio.TimerHandle] = {}
 
         # Set False by shutdown(). Everything this provider can emit -- mobility
@@ -197,8 +197,8 @@ class EmbeddedEncapsulator(IEncapsulator):
     Encapsulates the protocol to work with the embedded runner.
     """
 
-    def __init__(self, runner_configuration: RunnerConfiguration, loop: asyncio.AbstractEventLoop, session: aiohttp.ClientSession, backend=None):
-        self.provider = EmbeddedProvider(runner_configuration, loop, self.handle_timer, session, backend=backend)
+    def __init__(self, context: MissionContext, loop: asyncio.AbstractEventLoop, session: aiohttp.ClientSession, backend=None):
+        self.provider = EmbeddedProvider(context, loop, self.handle_timer, session, backend=backend)
         self._finished = False
 
     def encapsulate(self, protocol: Type[IProtocol]) -> None:

@@ -15,7 +15,7 @@ from gradys_embedded.encapsulator.embedded import EmbeddedEncapsulator
 from gradys_embedded.protocol.interface import IProtocol
 from gradys_embedded.protocol.messages.telemetry import Telemetry
 from gradys_embedded.protocol.position import cartesian_to_geo, geo_to_cartesian
-from gradys_embedded.runner.configuration import RunnerConfiguration
+from gradys_embedded.runner.configuration import MissionContext, RunnerConfiguration
 from gradys_embedded.runner.control_panel import create_control_app
 from gradys_embedded.runner.mission import MissionManager, MissionState
 
@@ -105,22 +105,22 @@ class EmbeddedRunner:
             self._loop.run_until_complete(self._session.close())
         self._loop.close()
 
-    async def resolve_frame(self, configuration: RunnerConfiguration) -> RunnerConfiguration:
+    async def resolve_frame(self, context: MissionContext) -> MissionContext:
         """Fill in any coordinate frame the mission did not supply.
 
         Runs at mission load, not at boot: the frame describes an experiment, so
-        it arrives with the mission. Returns a configuration with the gaps filled
-        from this drone's own telemetry.
+        it arrives with the mission. Returns a context whose mission half has the
+        gaps filled from this drone's own telemetry.
 
         Falling back is a last resort. Each drone resolves its *own* position and
         heading, so a fleet that relies on this ends up with every drone in a
         different cartesian frame — "go to (50, 0, 20)" then means a different
         place on each one, and nothing raises. Hence the warning.
         """
-        need_origin = configuration.origin_gps_coordinates is None
-        need_heading = configuration.x_axis_degrees is None
+        need_origin = context.origin_gps_coordinates is None
+        need_heading = context.x_axis_degrees is None
         if not (need_origin or need_heading):
-            return configuration
+            return context
 
         missing = ", ".join(
             name for name, want in [("origin_gps_coordinates", need_origin),
@@ -145,7 +145,8 @@ class EmbeddedRunner:
         if need_heading:
             overrides["x_axis_degrees"] = float(info["heading"])
 
-        resolved = replace(configuration, **overrides)
+        # The context is frozen; amend the mission half and rewrap.
+        resolved = MissionContext(context.provisioned, replace(context.mission, **overrides))
         self._logger.info(
             f"Frame resolved: origin={resolved.origin_gps_coordinates} "
             f"x_axis_degrees={resolved.x_axis_degrees}"
@@ -196,7 +197,7 @@ class EmbeddedRunner:
     # is local and fast; this only trips when something is genuinely wedged.
     BACKEND_START_TIMEOUT = 10.0
 
-    def _backend_signature(self, configuration: RunnerConfiguration) -> tuple:
+    def _backend_signature(self, configuration: MissionContext) -> tuple:
         """What must match for a running backend to be reusable.
 
         The transport itself plus its TLS material — a mission that changes
@@ -211,7 +212,7 @@ class EmbeddedRunner:
             return signature + (configuration.auto_scout, peers)
         return signature
 
-    async def start_backend(self, configuration: RunnerConfiguration) -> None:
+    async def start_backend(self, configuration: MissionContext) -> None:
         """Bind the data plane for this mission's transport.
 
         A no-op when the running backend already matches, so consecutive missions
@@ -251,7 +252,7 @@ class EmbeddedRunner:
             await self.stop_backend()
             raise RuntimeError(
                 f"{configuration.communication_protocol} data plane exited before "
-                f"becoming ready on port {configuration.resolve_data_port()}: {exc!r}"
+                f"becoming ready on port {configuration.data_port}: {exc!r}"
             )
         if not done:
             await self.stop_backend()
@@ -261,7 +262,7 @@ class EmbeddedRunner:
             )
         self._logger.info(
             f"Data plane serving {configuration.communication_protocol} "
-            f"on port {configuration.resolve_data_port()}"
+            f"on port {configuration.data_port}"
         )
 
     def _on_backend_finished(self, task: asyncio.Task) -> None:
@@ -305,8 +306,7 @@ class EmbeddedRunner:
 
     # -------------------------------------------------------- mission actions
 
-    async def goto_initial_position(self, configuration: RunnerConfiguration | None = None) -> bool:
-        configuration = configuration or self._configuration
+    async def goto_initial_position(self, configuration: MissionContext) -> bool:
         base_url = f"http://localhost:{self._configuration.uav_api_port}"
 
         arm_result = await self._session.get(f"{base_url}/command/arm")
@@ -329,7 +329,7 @@ class EmbeddedRunner:
         return True
 
     async def bootstrap_protocol(self, protocol_class: Type[IProtocol],
-                                 configuration: RunnerConfiguration | None = None) -> None:
+                                 configuration: MissionContext) -> None:
         """Install a protocol as the current mission's.
 
         The data-plane backend is untouched: both transports read
@@ -337,7 +337,6 @@ class EmbeddedRunner:
         inbound messages atomically without rebinding any port. The backend
         itself was bound earlier, at mission load, for this mission's transport.
         """
-        configuration = configuration or self._configuration
         if self._backend is None:
             raise RuntimeError(
                 "No data plane is serving; a mission must be loaded before a protocol starts."
@@ -384,19 +383,24 @@ class EmbeddedRunner:
 
     # ---------------------------------------------------------------- telemetry
 
+    # Poll rate while no mission is loaded. The loop still runs then -- it is
+    # the landing detector and the uav_api health signal -- but there is no
+    # mission to take a rate from, telemetry_interval being mission-scoped.
+    IDLE_TELEMETRY_INTERVAL = 0.5
+
     async def _periodic_telemetry(self) -> None:
         base_url = f"http://localhost:{self._configuration.uav_api_port}"
 
         while True:
-            # Read the ACTIVE MISSION's frame, not the process config. Mobility
-            # commands are converted with the mission's frame (the provider is
-            # built from the mission config), so converting telemetry with the
-            # boot frame would put the protocol somewhere other than where it is
-            # being sent -- with no error, visible only as strange flight data.
-            configuration = self._active_configuration()
-            interval = configuration.telemetry_interval
-            origin = configuration.origin_gps_coordinates
-            x_axis = configuration.x_axis_degrees
+            # Read the ACTIVE MISSION's frame. Mobility commands are converted
+            # with the mission's frame (the provider is built from the mission
+            # context), so converting telemetry with any other frame would put
+            # the protocol somewhere other than where it is being sent -- with
+            # no error, visible only as strange flight data.
+            context = self._active_context()
+            interval = context.telemetry_interval if context else self.IDLE_TELEMETRY_INTERVAL
+            origin = context.origin_gps_coordinates if context else None
+            x_axis = context.x_axis_degrees if context else None
 
             try:
                 async with self._session.get(f"{base_url}/telemetry/gps") as resp:
@@ -422,14 +426,11 @@ class EmbeddedRunner:
 
             await asyncio.sleep(interval)
 
-    def _active_configuration(self) -> RunnerConfiguration:
-        """The configuration in force right now.
-
-        The mission's overlay when one is loaded, otherwise what was provisioned.
-        """
-        if self.mission is not None and self.mission.mission_config is not None:
-            return self.mission.mission_config
-        return self._configuration
+    def _active_context(self) -> MissionContext | None:
+        """The loaded mission's effective configuration, or None while idle."""
+        if self.mission is not None:
+            return self.mission.context
+        return None
 
     def _check_for_landing(self, relative_alt) -> None:
         """Close out a RETURNING mission once the vehicle is back on the ground.
