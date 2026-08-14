@@ -1,6 +1,6 @@
 # Protocol Interface (Embedded Implementation Notes)
 
-**This doc is implementation-only.** The authoritative definition of `IProtocol`, `IProvider`, `instantiate`, the five lifecycle hooks, and `tracked_variables` lives in the simulator — see `→ https://github.com/Project-GrADyS/gradys-sim-nextgen/.claude/docs/protocol-lifecycle.md` which is the ecosystem's source of truth for the interface. This project's copy of `interface.py` mirrors that spec.
+**This doc is implementation-only.** The authoritative definition of `IProtocol`, `IProvider`, `instantiate`, the five lifecycle hooks, and `tracked_variables` lives in the simulator — see `→ https://github.com/Project-GrADyS/gradys-sim-nextgen/blob/main/.claude/docs/protocol-lifecycle.md` which is the ecosystem's source of truth for the interface. This project's copy of `interface.py` mirrors that spec.
 
 What follows is the **embedded-specific invocation story**: who calls each hook, when, on what thread, and what breaks if you violate asyncio's rules.
 
@@ -96,7 +96,7 @@ Direct imports from `gradysim.simulator.*` (handlers, simulation builder) break 
 
 ## Related docs
 
-- `→ https://github.com/Project-GrADyS/gradys-sim-nextgen/.claude/docs/protocol-lifecycle.md` — **authoritative** IProtocol/IProvider spec.
+- `→ https://github.com/Project-GrADyS/gradys-sim-nextgen/blob/main/.claude/docs/protocol-lifecycle.md` — **authoritative** IProtocol/IProvider spec.
 - `→ .claude/docs/runtime-model.md` — the asyncio loop that invokes these hooks.
 - `→ .claude/docs/encapsulator-interface.md` — how the encapsulator delegates each hook.
 - `→ .claude/docs/plugins-and-extensions.md` — dispatcher pattern for composing protocol behavior without subclassing.

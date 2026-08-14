@@ -1,6 +1,6 @@
 # Cross-Node Communication
 
-How protocols send and receive messages on real hardware. The inter-node **data plane** is selected by `communication_protocol`: for `http`/`https`/`http3` each drone runs a FastAPI server exposing `/message` and peers POST to it; for `zenoh_tcp`/`zenoh_quic` each drone runs an Eclipse Zenoh peer session and messages are pub/sub by key expression. Either way, this data plane is served on the drone's `node_ip_dict` port and is **separate from the control plane** (`/protocol/setup`, `/protocol/start`), which runs on `control_api_port` (`→ .claude/docs/runtime-model.md`).
+How protocols send and receive messages on real hardware. The inter-node **data plane** is selected by the mission's `communication_protocol` (supplied in `POST /mission/load`): for `http`/`https`/`http3` each drone runs a FastAPI server exposing `/message` and peers POST to it; for `zenoh_tcp`/`zenoh_quic` each drone runs an Eclipse Zenoh peer session and messages are pub/sub by key expression. Either way, this data plane is served on the drone's provisioned `data_port` — bound at **mission load**, not at boot — and is **separate from the control plane** (`/mission/*`, `/protocols/*`, `/runs/*`), which runs on `control_api_port` (`→ .claude/docs/runtime-model.md`).
 
 ## The `communication` module
 
@@ -8,13 +8,13 @@ Each transport lives behind a `CommunicationBackend` in `gradys_embedded/communi
 
 | File | Contents |
 |---|---|
-| `communication/base.py` | `CommunicationBackend` ABC (`serve`, `send`, `broadcast`, `close`) + fire-and-forget helper |
+| `communication/base.py` | `CommunicationBackend` ABC (`serve`, `send`, `broadcast`, `close`, `wait_ready`) + fire-and-forget helper |
 | `communication/http.py` | `http`, `https`, `http3` (shared `/message` FastAPI app + peer-`POST` send) |
 | `communication/zenoh.py` | `zenoh_tcp`, `zenoh_quic` (shared session/subscribe/publish; differ only in link transport + TLS) |
 | `communication/certs.py` | `generate_self_signed_cert()` + `resolve_tls_material()` (TLS material for https/http3/zenoh_quic) |
-| `communication/__init__.py` | `create_backend(runner)` factory keyed on `communication_protocol` |
+| `communication/__init__.py` | `create_backend(runner, context)` factory keyed on the mission's `communication_protocol` |
 
-`EmbeddedRunner._serve_communication` builds the backend via `create_backend(self)` and runs `backend.serve()` alongside the control plane; `EmbeddedProvider.send_communication_command` calls `backend.send(...)` / `backend.broadcast(...)`. `runner/control_panel.py` now holds **only** the control plane (`/protocol/*`).
+A backend is built **per mission**: `EmbeddedRunner.start_backend` (called from `/mission/load`) builds it via `create_backend(self, context)` from the mission's `MissionContext`, runs `backend.serve()` as a task, and awaits a readiness handshake — load only returns 200 once the listener is actually bound (a bind failure or a 10 s timeout fails the load with 500). Consecutive missions on the same transport reuse the running listener; a different transport releases and rebinds the same `data_port`. `EmbeddedProvider.send_communication_command` calls `backend.send(...)` / `backend.broadcast(...)`. `runner/control_panel.py` holds **only** the control plane (`/protocols`, `/mission`, `/runs`).
 
 Sources: `gradys_embedded/communication/` (transports), `gradys_embedded/runner/runner.py` (boot/dispatch), `gradys_embedded/encapsulator/embedded.py` (`send_communication_command`, sender).
 
@@ -39,11 +39,11 @@ Wire format: JSON `{"message": "<payload string>", "source": <sender_node_id>}`.
 
 The receiver's FastAPI route hands `payload.message` to the encapsulator, which calls the protocol's `handle_packet`. **The `source` field is discarded** — if your protocol needs the sender id, embed it in the message body (every example in `examples/simple/protocol.py` does this).
 
-The server listens on `0.0.0.0:<port>` where `<port>` comes from `node_ip_dict[node_id]` for its own id. The control plane (`/protocol/setup`, `/protocol/start`) is a **separate** FastAPI app on `control_api_port` (`→ .claude/docs/runtime-model.md`). Both share the asyncio loop with the rest of the runner — there is no separate thread.
+The server listens on `0.0.0.0:<data_port>` — the provisioned bind port; `node_ip_dict` no longer supplies it, so every peer's entry for this node must point at its `data_port`. The control plane (`/mission/*`, `/protocols/*`, `/runs/*`) is a **separate** FastAPI app on `control_api_port` (`→ .claude/docs/runtime-model.md`). Both share the asyncio loop with the rest of the runner — there is no separate thread.
 
 ## Transport — http (default) vs https vs http3 vs zenoh_tcp vs zenoh_quic
 
-The data plane runs over one of five transports, selected by `RunnerConfiguration.communication_protocol` (default `"http"`). For the three HTTP transports the FastAPI app, the `/message` route, and the wire payload are **identical**; only the server and client transport change. The two zenoh transports are likewise identical except for their link transport (TCP vs QUIC/TLS). `communication_protocol` must be the same on every node.
+The data plane runs over one of five transports, selected by the mission's `communication_protocol` in `POST /mission/load` (default `"http"`); only the chosen one is ever served. For the three HTTP transports the FastAPI app, the `/message` route, and the wire payload are **identical**; only the server and client transport change. The two zenoh transports are likewise identical except for their link transport (TCP vs QUIC/TLS). `communication_protocol` must be the same on every node.
 
 | | `"http"` (default) | `"https"` | `"http3"` | `"zenoh_tcp"` | `"zenoh_quic"` |
 |---|---|---|---|---|---|
@@ -55,7 +55,7 @@ The data plane runs over one of five transports, selected by `RunnerConfiguratio
 | TLS | none | server cert | server cert | **none** | **mandatory**; fleet-wide shared cert |
 | Deps | core install | core install | `pip install "gradys-embedded[http3]"` | `pip install "gradys-embedded[zenoh]"` | `pip install "gradys-embedded[zenoh]"` |
 
-`"https"` and `"http3"` both require the server to present a certificate. If `certfile`/`keyfile` are set in the configuration, the server binds with them and the client **verifies peers against `certfile`**. If they are omitted, the server binds with an **ephemeral self-signed certificate generated at boot** (temp file, not persisted) and the client disables verification (`ssl=False` for https, `verify=False` for http3) — the channel is still encrypted, but peers are not authenticated. See `→ .claude/docs/configuration.md`.
+`"https"` and `"http3"` both require the server to present a certificate. If `certfile`/`keyfile` are provisioned, the server binds with them and the client **verifies peers against `certfile`**. If they are omitted, the server binds with an **ephemeral self-signed certificate generated when the backend is built at mission load** (temp file, not persisted) and the client disables verification (`ssl=False` for https, `verify=False` for http3) — the channel is still encrypted, but peers are not authenticated. See `→ .claude/docs/configuration.md`.
 
 The local `uav_api` connection is unaffected by `communication_protocol`; it always uses plain HTTP on `localhost`.
 
@@ -64,18 +64,18 @@ The local `uav_api` connection is unaffected by `communication_protocol`; it alw
 For both zenoh transports, `ZenohBackend.serve` opens one `zenoh.Session` in `mode: "peer"` and declares two subscribers: the node's inbox `gradys/msg/<node_id>` and the shared `gradys/msg/broadcast`. There is no FastAPI `/message` server in these modes. The same session is used by the backend's `send`/`broadcast` for publishing. The **only** difference between the two is the link scheme:
 
 - **`zenoh_tcp`** — links are `tcp/<ip:port>`, no TLS.
-- **`zenoh_quic`** — links are `quic/<ip:port>` over TLS 1.3. Zenoh QUIC **mandates** TLS and verifies the listener's cert against a `root_ca_certificate`; the only relaxation is `verify_name_on_connect=false` (ignores hostname/SAN, since endpoints are IP-addressed). The backend sets `listen_certificate`/`listen_private_key`/`root_ca_certificate` all to the configured cert (a self-signed cert is its own CA). **Every node must therefore share the SAME certificate** — see the security model below. If no `certfile` is configured, `serve` logs a loud warning that peers will not trust each other.
+- **`zenoh_quic`** — links are `quic/<ip:port>` over TLS 1.3. Zenoh QUIC **mandates** TLS and verifies the listener's cert against a `root_ca_certificate`; the only relaxation is `verify_name_on_connect=false` (ignores hostname/SAN, since endpoints are IP-addressed). The backend sets `listen_certificate`/`listen_private_key`/`root_ca_certificate` all to the configured cert (a self-signed cert is its own CA). **Every node must therefore share the SAME certificate** — see the security model below. A mission selecting `zenoh_quic` on a node with no provisioned `certfile` is **rejected with 400 at `/mission/load`** (the ephemeral fallback would make the fleet silently fail to mesh); the loud warning in `serve` remains only as a backstop for backends built outside the mission path.
 
 Discovery follows `auto_scout` (same for both):
 
-- **`auto_scout=False`** (default) — multicast disabled (`scouting/multicast/enabled = false`), gossip enabled, the session **listens** on `<scheme>/<own_ip>:<port>` and **connects** to `<scheme>/<ip:port>` for every other entry in `node_ip_dict`. `node_ip_dict` stays authoritative; works on multicast-blocked LANs.
-- **`auto_scout=True`** — default UDP multicast scouting (`224.0.0.224:7446`); peers auto-discover. For `zenoh_quic` the backend additionally pins an explicit `quic/0.0.0.0:<port>` listen endpoint so advertised data links are QUIC rather than the default TCP listener.
+- **`auto_scout=False`** (default) — multicast disabled (`scouting/multicast/enabled = false`), gossip enabled, the session **listens** on `<scheme>/<own_ip>:<data_port>` (the IP comes from this node's own `node_ip_dict` entry — which is why load returns 400 if the mission's map omits it; the port is always the provisioned `data_port`) and **connects** to `<scheme>/<ip:port>` for every other entry in `node_ip_dict`. The map stays authoritative; works on multicast-blocked LANs.
+- **`auto_scout=True`** — default UDP multicast scouting (`224.0.0.224:7446`); peers auto-discover, and this is the one configuration where `/mission/load` accepts a missing `node_ip_dict`. For `zenoh_quic` the backend additionally pins an explicit `quic/0.0.0.0:<data_port>` listen endpoint so advertised data links are QUIC rather than the default TCP listener.
 
 **Wire payload is unchanged** — `json.dumps({"message": ..., "source": <id>})` encoded to bytes; the subscriber decodes and forwards `data["message"]`, so `source` is carried-but-discarded exactly like HTTP.
 
 **Threading bridge.** Zenoh subscriber callbacks fire on a Zenoh-owned thread, not the asyncio loop. The callback only does `runner._loop.call_soon_threadsafe(runner._encapsulator.handle_packet, message)` — handing the message to the runner's single loop. Never call protocol code directly from the callback.
 
-**Until `/protocol/start` has succeeded, inbound messages are dropped.** The data plane (uvicorn for HTTP, the Zenoh session for zenoh) binds from the moment `start_api()` runs, but the encapsulator that owns `handle_packet` only exists after start — so HTTP `/message` returns 409 and the Zenoh subscriber callback drops the sample. Peers that broadcast during their own `initialize` may be ignored by receivers that have not started yet.
+**Until `/mission/start` has succeeded, inbound messages are dropped.** The data plane (uvicorn for HTTP, the Zenoh session for zenoh) binds at `/mission/load` — before a load, nothing listens on `data_port` at all and a peer's send fails at the connection level. Between load and start the listener is up but the encapsulator that owns `handle_packet` does not exist yet — so HTTP `/message` returns 409 and the Zenoh subscriber callback drops the sample. (The same guard returns after `/mission/stop` or `/mission/reset` tears the protocol down.) Peers that broadcast during their own `initialize` may be ignored by receivers that have not started yet.
 
 ## Sending — SEND
 
@@ -93,8 +93,9 @@ The provider builds `{"message": "hello", "source": <my_id>}` and calls `backend
 Failure modes:
 
 - **Unknown destination** (HTTP transports) — `node_ip_dict.get(destination)` returns `None`; the backend logs `"Unknown destination node <id>"` and drops the message. No exception reaches the protocol.
+- **No peer map at all** (HTTP transports) — load-time validation makes this unreachable in the normal path, but the backend guards anyway: it logs `"No peer map for this mission"` and drops the send/broadcast rather than crash a flying protocol.
 - **Peer unreachable / timeout / connection refused** — the aiohttp task fails; `_log_task_exception` logs the error. The protocol is never notified.
-- **Peer returns non-200** — the provider logs `"POST <url> returned <status>: <body>"`. The protocol is never notified.
+- **Peer returns non-200** — the backend logs `"POST <url> returned <status>: <body>"`. The protocol is never notified.
 
 **The protocol never learns about delivery outcomes.** Design all peer interactions as unreliable. If you need acknowledgments, implement them at the protocol level (e.g., expect an ACK message within a timer window; resend on timeout).
 
@@ -119,6 +120,8 @@ HTTP-transport sends go through the backend's `_fire_and_forget` (`communication
 ```python
 def _fire_and_forget(self, coro) -> None:
     task = self._runner._loop.create_task(coro)
+    self._pending_tasks.add(task)                       # asyncio holds only a weak ref;
+    task.add_done_callback(self._pending_tasks.discard) # keep the send alive until done
     task.add_done_callback(self._log_task_exception)
 ```
 
@@ -129,7 +132,7 @@ def _fire_and_forget(self, coro) -> None:
 
 ## Peer discovery — none, except zenoh + `auto_scout`
 
-For HTTP transports and for the zenoh transports with `auto_scout=False`, `node_ip_dict` is static configuration. If a new drone joins the fleet mid-flight, existing drones do not know about it. If a drone's IP changes (DHCP lease expires, switches networks), every other drone's `node_ip_dict` is now wrong and messages to it drop silently.
+For HTTP transports and for the zenoh transports with `auto_scout=False`, `node_ip_dict` is mission-supplied — every `POST /mission/load` carries the map (400 without it), and it is fixed into the mission's context for the mission's duration. **Within a running mission there is no discovery**: a new drone joining mid-flight is unknown to the others, and if a drone's IP changes (DHCP lease expires, switches networks) every other drone's map is now wrong and messages to it drop silently. **Between missions**, though, the fleet can gain or lose a drone, or change addresses, simply by loading the next mission with an updated map — no drone needs re-provisioning, since the map is no longer part of the provisioned configuration.
 
 **Pin IPs.** Use static leases, a dedicated ad-hoc/mesh network, or a private LAN with reserved addresses. Do not rely on DHCP for fleet deployment.
 
@@ -149,14 +152,14 @@ If you need authentication, wrap the payload in a signed envelope at the protoco
 
 ## Debugging communication problems
 
-1. **Is `/message` reachable?** (HTTP transports.) From one drone: `curl -X POST http://<peer>:<port>/message -H 'Content-Type: application/json' -d '{"message":"test","source":0}'` should return `{"status":"ok"}`. Under the zenoh transports there is no `/message` route — instead check the boot log for `Zenoh peer session open (transport=tcp|quic, ...)` and, for `auto_scout=False`, that every peer's `<scheme>/<ip:port>` connect endpoint is reachable; `curl` the **control** port (`control_api_port`) for `/protocol/*` instead. For `zenoh_quic`, a `peers will NOT trust each other` warning means no shared `certfile` is set — fix that before chasing connectivity.
-2. **Is `node_ip_dict` right?** A common bug is different drones having drifted copies of `node_ip_dict`. Compare against ground truth on each drone.
+1. **Is `/message` reachable?** (HTTP transports.) It only exists once a mission has loaded — before `/mission/load` nothing listens on `data_port` and the connection is refused. From one drone: `curl -X POST http://<peer>:<data_port>/message -H 'Content-Type: application/json' -d '{"message":"test","source":0}'` should return `{"status":"ok"}` (or 409 before `/mission/start` — which still proves the listener is up). Under the zenoh transports there is no `/message` route — instead check the mission-load log for `Zenoh peer session open (transport=tcp|quic, ...)` and, for `auto_scout=False`, that every peer's `<scheme>/<ip:port>` connect endpoint is reachable; `curl` the **control** port (`control_api_port`, `GET /mission/status`) instead. For `zenoh_quic`, remember `/mission/load` already rejects it with 400 when no shared `certfile` is provisioned.
+2. **Is `node_ip_dict` right?** A common bug is drones loaded with drifted copies of the map, or entries not pointing at each peer's `data_port`. `GET /mission/status` echoes the map each drone actually loaded — diff them across the fleet.
 3. **Are sends failing silently?** Check each drone's log for `Fire-and-forget task failed:` or `POST ... returned ...` entries. These are the only signal of a send failure.
 4. **Is the receiver blocking?** If peer A's `handle_packet` runs slowly, peer B's subsequent sends to A back up. Profile `handle_packet` for hidden blocking calls.
 
 ## Related docs
 
-- `→ .claude/docs/runtime-model.md` — when uvicorn (and therefore the `/message` router) starts listening relative to `/protocol/start` and `initialize()`.
-- `→ .claude/docs/configuration.md` — `node_ip_dict` shape and shared-origin requirement.
+- `→ .claude/docs/runtime-model.md` — when the data plane binds (`/mission/load`) relative to `/mission/start` and `initialize()`.
+- `→ .claude/docs/configuration.md` — `node_ip_dict` shape, `data_port`, and the shared-frame requirement.
 - `→ .claude/docs/protocol-interface.md` — how `handle_packet` is invoked on the asyncio loop.
-- `→ https://github.com/Project-GrADyS/gradys-sim-nextgen/.claude/docs/messages-and-telemetry.md` — the abstract `CommunicationCommand` types (SEND, BROADCAST).
+- `→ https://github.com/Project-GrADyS/gradys-sim-nextgen/blob/main/.claude/docs/messages-and-telemetry.md` — the abstract `CommunicationCommand` types (SEND, BROADCAST).
